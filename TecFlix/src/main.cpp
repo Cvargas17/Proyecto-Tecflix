@@ -46,7 +46,8 @@ using std::vector;
 static const uint64_t MAX_UPLOAD = 4ULL << 30;  // 4 GiB
 static const size_t MAX_FORM = 64 * 1024;
 static fs::path DATA_DIR = "data";
-static fs::path WEB_DIR = "web";
+static fs::path WEB_DIR = "web/dist";  // React build output (see frontend/)
+static string gFfmpeg;                  // path to ffmpeg; empty when DASH packaging is unavailable
 
 // ---------------------------------------------------------------- utilities
 
@@ -196,6 +197,7 @@ struct Video {
     double duration = 0;
     int width = 0, height = 0, tracks = 0;
     string vcodec, acodec, brand;
+    string dash = "unavailable";  // unavailable | processing | ready | failed
 };
 struct User {
     string name, salt, hash;
@@ -232,7 +234,7 @@ static void saveVideos() {  // caller holds gMutex
         o << v.id << '\t' << v.owner << '\t' << clean(v.title) << '\t' << v.visibility << '\t' << v.file << '\t'
           << clean(v.orig) << '\t' << v.mime << '\t' << v.size << '\t' << v.uploaded << '\t' << v.created << '\t'
           << v.duration << '\t' << v.width << '\t' << v.height << '\t' << v.tracks << '\t' << v.vcodec << '\t'
-          << v.acodec << '\t' << v.brand << '\n';
+          << v.acodec << '\t' << v.brand << '\t' << v.dash << '\n';
 }
 static void loadDb() {
     std::string line;
@@ -250,6 +252,8 @@ static void loadDb() {
         x.mime = f[6]; x.size = std::stoull(f[7]); x.uploaded = std::stoll(f[8]); x.created = std::stoll(f[9]);
         x.duration = std::stod(f[10]); x.width = std::stoi(f[11]); x.height = std::stoi(f[12]);
         x.tracks = std::stoi(f[13]); x.vcodec = f[14]; x.acodec = f[15]; x.brand = f[16];
+        if (f.size() > 17) x.dash = f[17];
+        if (x.dash == "processing") x.dash = "failed";  // server stopped mid-packaging
         gVideos.push_back(x);
     }
 }
@@ -475,7 +479,7 @@ static string videoJson(const Video& v, const string& me) {
       << ",\"size\":" << v.size << ",\"mime\":" << jstr(v.mime) << ",\"duration\":" << v.duration
       << ",\"width\":" << v.width << ",\"height\":" << v.height << ",\"vcodec\":" << jstr(v.vcodec)
       << ",\"acodec\":" << jstr(v.acodec) << ",\"brand\":" << jstr(v.brand) << ",\"tracks\":" << v.tracks
-      << ",\"created\":" << v.created << ",\"bitrate\":" << (long long)br << "}}";
+      << ",\"created\":" << v.created << ",\"bitrate\":" << (long long)br << "},\"dash\":" << jstr(v.dash) << "}";
     return o.str();
 }
 static bool canSee(const Video& v, const string& me) { return v.visibility == "public" || v.owner == me; }
@@ -505,6 +509,42 @@ static void handleAuth(sock_t s, Req& r, bool reg) {
     gSessions[tok] = name;
     json(s, 200, "{\"username\":" + jstr(name) + "}",
          "Set-Cookie: tf_session=" + tok + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800\r\n");
+}
+
+// ---- DASH packaging (ffmpeg): data/dash/<id>/manifest.mpd + fMP4 segments ----
+
+static std::mutex gDashMutex;  // package one video at a time
+
+static void packageDash(Video v) {  // runs on a worker thread
+    std::lock_guard<std::mutex> one(gDashMutex);
+    std::error_code ec;
+    fs::path in = fs::absolute(DATA_DIR / "videos" / v.file, ec);
+    fs::path out = fs::absolute(DATA_DIR / "dash" / v.id, ec);
+    fs::create_directories(out, ec);
+    // Re-use H.264 / AAC streams as they are; otherwise transcode to browser-friendly codecs.
+    string vc = v.vcodec == "avc1" ? "copy" : "libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -g 96 -sc_threshold 0";
+    string ac = v.acodec == "mp4a" ? "copy" : "aac -b:a 128k";
+    // ffmpeg writes segment files relative to its working directory, so run it inside the output folder.
+#ifdef _WIN32
+    string cd = "cd /d \"" + out.string() + "\" && ";
+#else
+    string cd = "cd \"" + out.string() + "\" && ";
+#endif
+    string cmd = cd + "\"" + gFfmpeg + "\" -nostdin -y -loglevel error -i \"" + in.string() +
+                 "\" -map 0:v:0 -map 0:a:0? -c:v " + vc + " -c:a " + ac +
+                 " -f dash -seg_duration 4 -use_template 1 -use_timeline 1 manifest.mpd";
+#ifdef _WIN32
+    cmd = "\"" + cmd + "\"";  // cmd.exe strips one outer pair of quotes
+#endif
+    bool ok = std::system(cmd.c_str()) == 0 && fs::exists(out / "manifest.mpd", ec);
+    bool found = false;
+    {
+        std::lock_guard<std::mutex> g(gMutex);
+        for (auto& x : gVideos)
+            if (x.id == v.id) { x.dash = ok ? "ready" : "failed"; found = true; }
+        if (found) saveVideos();
+    }
+    if (!ok || !found) fs::remove_all(out, ec);  // failed, or the video was deleted meanwhile
 }
 
 static void handleUpload(sock_t s, Req& r, const string& me) {
@@ -538,14 +578,15 @@ static void handleUpload(sock_t s, Req& r, const string& me) {
     v.visibility = r.q["visibility"] == "public" ? "public" : "private";
     v.uploaded = (int64_t)time(nullptr);
     probe(v, path);
+    if (!gFfmpeg.empty()) v.dash = "processing";
     std::lock_guard<std::mutex> g(gMutex);
     gVideos.push_back(v);
     saveVideos();
+    if (!gFfmpeg.empty()) std::thread(packageDash, v).detach();
     json(s, 201, videoJson(v, me));
 }
 
-static void streamVideo(sock_t s, const Req& r, const Video& v) {
-    fs::path path = DATA_DIR / "videos" / v.file;
+static void streamFile(sock_t s, const Req& r, const fs::path& path, const string& mime) {
     std::ifstream f(path, std::ios::binary);
     std::error_code ec;
     uint64_t size = fs::file_size(path, ec);
@@ -573,7 +614,7 @@ static void streamVideo(sock_t s, const Req& r, const Video& v) {
         }
     }
     uint64_t len = size ? b - a + 1 : 0;
-    string h = headerBlock(code, v.mime, len, extra + "Cache-Control: private, max-age=3600\r\n");
+    string h = headerBlock(code, mime, len, extra + "Cache-Control: private, max-age=3600\r\n");
     if (!sendAll(s, h.data(), h.size())) return;
     f.seekg((std::streamoff)a);
     vector<char> buf(256 * 1024);
@@ -591,7 +632,12 @@ static void serveStatic(sock_t s, string p) {
     fs::path path = WEB_DIR / p.substr(1);
     static const std::map<string, string> types = {
         {".html", "text/html; charset=utf-8"}, {".css", "text/css; charset=utf-8"},
-        {".js", "application/javascript; charset=utf-8"}, {".svg", "image/svg+xml"}, {".ico", "image/x-icon"}};
+        {".js", "application/javascript; charset=utf-8"}, {".svg", "image/svg+xml"}, {".ico", "image/x-icon"},
+        {".json", "application/json"}, {".map", "application/json"}, {".png", "image/png"},
+        {".jpg", "image/jpeg"}, {".woff2", "font/woff2"}, {".woff", "font/woff"}, {".txt", "text/plain"}};
+    std::error_code ec;
+    if (!fs::is_regular_file(path, ec) && path.extension().empty())  // single-page-app fallback
+        path = WEB_DIR / "index.html";
     auto t = types.find(lower(path.extension().string()));
     std::ifstream f(path, std::ios::binary);
     if (t == types.end() || !f || fs::is_directory(path)) return fail(s, 404, "Not found");
@@ -637,6 +683,24 @@ static void route(sock_t s, Req& r) {
         return json(s, 200, out + "]");
     }
 
+    // /dash/<id>/<file>: manifest and segments of a packaged video
+    if (p.rfind("/dash/", 0) == 0 && (m == "GET" || m == "HEAD")) {
+        string rest = p.substr(6);
+        size_t sl = rest.find('/');
+        string did = rest.substr(0, sl), name = sl == string::npos ? "" : rest.substr(sl + 1);
+        bool okName = !name.empty() && name.find("..") == string::npos &&
+                      std::all_of(name.begin(), name.end(),
+                                  [](unsigned char c) { return isalnum(c) || c == '.' || c == '_' || c == '-'; });
+        if (!isHexId(did) || !okName) return fail(s, 404, "Not found");
+        {
+            std::lock_guard<std::mutex> g(gMutex);
+            auto it = std::find_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == did; });
+            if (it == gVideos.end() || !canSee(*it, me) || it->dash != "ready") return fail(s, 404, "Not found");
+        }
+        string ext = lower(fs::path(name).extension().string());
+        return streamFile(s, r, DATA_DIR / "dash" / did / name, ext == ".mpd" ? "application/dash+xml" : "video/mp4");
+    }
+
     // /api/videos/<id>  and  /video/<id>
     string id;
     bool isApi = p.rfind("/api/videos/", 0) == 0, isStream = p.rfind("/video/", 0) == 0;
@@ -651,7 +715,7 @@ static void route(sock_t s, Req& r) {
             if (it == gVideos.end() || !canSee(*it, me)) return fail(s, 404, "Video not found");
             copy = *it;
         }
-        if (isStream) return (m == "GET" || m == "HEAD") ? streamVideo(s, r, copy) : fail(s, 405, "Method not allowed");
+        if (isStream) return (m == "GET" || m == "HEAD") ? streamFile(s, r, DATA_DIR / "videos" / copy.file, copy.mime) : fail(s, 405, "Method not allowed");
         if (m == "GET") return json(s, 200, videoJson(copy, me));
         if (copy.owner != me) return fail(s, 403, "Only the owner can do that");
         if (m == "DELETE") {
@@ -661,6 +725,7 @@ static void route(sock_t s, Req& r) {
             saveVideos();
             std::error_code ec;
             fs::remove(DATA_DIR / "videos" / copy.file, ec);
+            fs::remove_all(DATA_DIR / "dash" / id, ec);
             return json(s, 200, "{}");
         }
         if (m == "POST") {  // update title and/or visibility
@@ -719,6 +784,24 @@ int main(int argc, char** argv) {
     int port = argc > 1 ? std::atoi(argv[1]) : 8080;
     fs::create_directories(DATA_DIR / "videos");
     loadDb();
+    {   // DASH packaging needs ffmpeg: TECFLIX_FFMPEG, or "ffmpeg" from PATH
+        const char* env = std::getenv("TECFLIX_FFMPEG");
+        string cand = env && *env ? env : "ffmpeg";
+#ifdef _WIN32
+        string probeCmd = "\"\"" + cand + "\" -version >NUL 2>&1\"";
+#else
+        string probeCmd = "\"" + cand + "\" -version >/dev/null 2>&1";
+#endif
+        if (std::system(probeCmd.c_str()) == 0) gFfmpeg = cand;
+        std::cout << (gFfmpeg.empty() ? "ffmpeg not found: DASH disabled, videos play as plain MP4/WebM\n"
+                                      : "ffmpeg found: uploads are packaged for MPEG-DASH\n");
+        if (!gFfmpeg.empty()) {
+            std::lock_guard<std::mutex> g(gMutex);
+            for (auto& v : gVideos)  // package videos uploaded before DASH support existed
+                if (v.dash == "unavailable") { v.dash = "processing"; std::thread(packageDash, v).detach(); }
+            saveVideos();
+        }
+    }
 #ifdef _WIN32
     WSADATA wsa;
     WSAStartup(MAKEWORD(2, 2), &wsa);

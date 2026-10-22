@@ -1,27 +1,27 @@
 # TecFlix
 
-A self-hosted video sharing web app written in C++17 with **no third-party dependencies**
-(own HTTP server on Winsock/BSD sockets, own SHA-256, own MP4 parser). The UI is a single
-static page in `web/`.
+Self-hosted video sharing. **Backend:** C++17, no third-party libraries (own HTTP server, SHA-256,
+MP4 parser). **Frontend:** React + TypeScript (Vite) with **dash.js** playback.
 
-## Build & run
+## Run
 
-Windows (MSYS2/MinGW g++): `build.bat` · Linux/macOS: `make`
+1. Build the frontend once (needs Node 20+): `cd frontend && npm install && npm run build` → `web/dist`
+2. Build the server (MSYS2 g++): `build.bat` (or `make` on Linux/macOS)
+3. Install **ffmpeg** and make sure it is on `PATH` (or set `TECFLIX_FFMPEG` to its full path)
+4. From this folder: `tecflix.exe [port]` (default 8080) → http://localhost:8080
 
-```
-tecflix.exe [port]      # default 8080; run from this folder so ./web and ./data resolve
-```
-Open http://localhost:8080
+Frontend development: run `tecflix.exe`, then `cd frontend && npm run dev` (http://localhost:5173, proxies the API).
+
+## How DASH works here
+On upload the server runs ffmpeg in the background and writes `data/dash/<id>/manifest.mpd` plus fMP4 segments
+(H.264/AAC streams are copied, anything else is transcoded). The video's `dash` status goes
+`processing` → `ready` (or `failed`); the player uses dash.js when `ready` and the original file otherwise.
+Videos uploaded before this feature are packaged automatically when the server starts with ffmpeg available.
+Without ffmpeg everything still works, using plain progressive playback.
 
 ## Features
-- Accounts (register / login / logout; salted, iterated SHA-256 password hashes; HttpOnly session cookie)
-- Upload (mp4, m4v, mov, webm, ogv, mkv, up to 4 GiB) with progress bar
-- Watch with seeking (HTTP Range streaming)
-- Delete, rename, and switch **public / private** (private videos are invisible to everyone but the owner)
-- Metadata panel: file name/size/type, duration, resolution + aspect ratio, video/audio codec,
-  container brand, track count, average bitrate, media creation date, upload date
+accounts · upload (mp4/m4v/mov/webm/ogv/mkv, ≤ 4 GiB) · watch · delete · rename · public/private visibility ·
+metadata panel (size, type, duration, resolution, codecs, brand, tracks, bitrate, dates).
+MP4/MOV files get full metadata; other containers show size and type only.
 
-## Notes
-- Data lives in `data/` (`users.db`, `videos.db`, `videos/`).
-- Deep metadata (duration, resolution, codecs) is parsed from MP4/MOV; WebM/OGV/MKV show size/type only.
-- Plain HTTP with no rate limiting: put it behind a TLS reverse proxy before exposing it to the internet.
+Data lives in `data/`. Plain HTTP, no rate limiting: put it behind a TLS proxy before exposing it publicly.
