@@ -3,7 +3,9 @@
 //
 // Features: accounts, upload, streaming (HTTP Range), delete, public/private
 // visibility, title editing and metadata extraction (MP4/MOV box parser).
-
+#include <condition_variable>
+#include <queue>
+#include <array>
 #include <algorithm>
 #include <atomic>
 #include <cstdint>
@@ -20,7 +22,7 @@
 #include <string>
 #include <thread>
 #include <vector>
-
+#include <unordered_map>
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -33,6 +35,7 @@ using sock_t = SOCKET;
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
+#include <semaphore>
 using sock_t = int;
 #define INVALID_SOCKET (-1)
 #define CLOSESOCK close
@@ -207,6 +210,11 @@ static std::mutex gMutex;
 static vector<Video> gVideos;
 static vector<User> gUsers;
 static std::map<string, string> gSessions;  // token -> username
+static std::unordered_map<std::string, size_t> gVideoIndex;
+static std::mutex gQueueMutex;
+static std::condition_variable gQueueCondition;
+static std::queue<sock_t> gConnectionQueue;
+static bool gServerRunning = true;
 
 static string clean(string s) {
     for (auto& c : s)
@@ -253,8 +261,10 @@ static void loadDb() {
         x.duration = std::stod(f[10]); x.width = std::stoi(f[11]); x.height = std::stoi(f[12]);
         x.tracks = std::stoi(f[13]); x.vcodec = f[14]; x.acodec = f[15]; x.brand = f[16];
         if (f.size() > 17) x.dash = f[17];
-        if (x.dash == "processing") x.dash = "failed";  // server stopped mid-packaging
+        if (x.dash == "processing") x.dash = "failed";// server stopped mid-packaging
+
         gVideos.push_back(x);
+        gVideoIndex[x.id] = gVideos.size() - 1;
     }
 }
 
@@ -513,10 +523,21 @@ static void handleAuth(sock_t s, Req& r, bool reg) {
 
 // ---- DASH packaging (ffmpeg): data/dash/<id>/manifest.mpd + fMP4 segments ----
 
-static std::mutex gDashMutex;  // package one video at a time
+static std::mutex gDashMutex;
+static std::condition_variable gDashCondition;
+static int gDashActive = 0;
+static const int MAX_DASH_JOBS = 2;
 
 static void packageDash(Video v) {  // runs on a worker thread
-    std::lock_guard<std::mutex> one(gDashMutex);
+    {
+        std::unique_lock<std::mutex> lock(gDashMutex);
+
+        gDashCondition.wait(lock, [] {
+            return gDashActive < MAX_DASH_JOBS;
+        });
+
+        ++gDashActive;
+    }
     std::error_code ec;
     fs::path in = fs::absolute(DATA_DIR / "videos" / v.file, ec);
     fs::path out = fs::absolute(DATA_DIR / "dash" / v.id, ec);
@@ -540,11 +561,25 @@ static void packageDash(Video v) {  // runs on a worker thread
     bool found = false;
     {
         std::lock_guard<std::mutex> g(gMutex);
-        for (auto& x : gVideos)
-            if (x.id == v.id) { x.dash = ok ? "ready" : "failed"; found = true; }
-        if (found) saveVideos();
+
+        auto indexIt = gVideoIndex.find(v.id);
+
+        if (indexIt != gVideoIndex.end()) {
+            Video& x = gVideos[indexIt->second];
+            x.dash = ok ? "ready" : "failed";
+            found = true;
+        }
+
+        if (found)
+            saveVideos();
     }
     if (!ok || !found) fs::remove_all(out, ec);  // failed, or the video was deleted meanwhile
+    {
+        std::lock_guard<std::mutex> lock(gDashMutex);
+        --gDashActive;
+    }
+
+    gDashCondition.notify_one();
 }
 
 static void handleUpload(sock_t s, Req& r, const string& me) {
@@ -580,9 +615,15 @@ static void handleUpload(sock_t s, Req& r, const string& me) {
     probe(v, path);
     if (!gFfmpeg.empty()) v.dash = "processing";
     std::lock_guard<std::mutex> g(gMutex);
+
     gVideos.push_back(v);
+    gVideoIndex[v.id] = gVideos.size() - 1;
+
     saveVideos();
-    if (!gFfmpeg.empty()) std::thread(packageDash, v).detach();
+
+    if (!gFfmpeg.empty())
+        std::thread(packageDash, v).detach();
+
     json(s, 201, videoJson(v, me));
 }
 
@@ -617,7 +658,7 @@ static void streamFile(sock_t s, const Req& r, const fs::path& path, const strin
     string h = headerBlock(code, mime, len, extra + "Cache-Control: private, max-age=3600\r\n");
     if (!sendAll(s, h.data(), h.size())) return;
     f.seekg((std::streamoff)a);
-    vector<char> buf(256 * 1024);
+    static thread_local std::array<char, 256 * 1024> buf;
     while (len) {
         f.read(buf.data(), (std::streamsize)std::min<uint64_t>(buf.size(), len));
         auto n = (size_t)f.gcount();
@@ -671,15 +712,31 @@ static void route(sock_t s, Req& r) {
 
     if (p == "/api/videos" && m == "GET") {
         bool mine = r.q["scope"] == "mine";
-        if (mine && me.empty()) return fail(s, 401, "Log in first");
-        std::lock_guard<std::mutex> g(gMutex);
+
+        if (mine && me.empty())
+            return fail(s, 401, "Log in first");
+
+        vector<Video> videosCopy;
+
+        {
+            std::lock_guard<std::mutex> g(gMutex);
+
+            for (auto it = gVideos.rbegin(); it != gVideos.rend(); ++it) {
+                if (mine ? it->owner != me : it->visibility != "public")
+                    continue;
+
+                videosCopy.push_back(*it);
+            }
+        }
+
         string out = "[";
         bool first = true;
-        for (auto it = gVideos.rbegin(); it != gVideos.rend(); ++it) {
-            if (mine ? it->owner != me : it->visibility != "public") continue;
-            out += (first ? "" : ",") + videoJson(*it, me);
+
+        for (const auto& video : videosCopy) {
+            out += (first ? "" : ",") + videoJson(video, me);
             first = false;
         }
+
         return json(s, 200, out + "]");
     }
 
@@ -694,8 +751,16 @@ static void route(sock_t s, Req& r) {
         if (!isHexId(did) || !okName) return fail(s, 404, "Not found");
         {
             std::lock_guard<std::mutex> g(gMutex);
-            auto it = std::find_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == did; });
-            if (it == gVideos.end() || !canSee(*it, me) || it->dash != "ready") return fail(s, 404, "Not found");
+
+            auto indexIt = gVideoIndex.find(did);
+
+            if (indexIt == gVideoIndex.end())
+                return fail(s, 404, "Not found");
+
+            Video& video = gVideos[indexIt->second];
+
+            if (!canSee(video, me) || video.dash != "ready")
+                return fail(s, 404, "Not found");
         }
         string ext = lower(fs::path(name).extension().string());
         return streamFile(s, r, DATA_DIR / "dash" / did / name, ext == ".mpd" ? "application/dash+xml" : "video/mp4");
@@ -708,20 +773,35 @@ static void route(sock_t s, Req& r) {
     else if (isStream) id = p.substr(7);
     if (isApi || isStream) {
         if (!isHexId(id)) return fail(s, 404, "Not found");
+
         Video copy;
         {
             std::lock_guard<std::mutex> g(gMutex);
-            auto it = std::find_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == id; });
-            if (it == gVideos.end() || !canSee(*it, me)) return fail(s, 404, "Video not found");
-            copy = *it;
+
+            auto indexIt = gVideoIndex.find(id);
+
+            if (indexIt == gVideoIndex.end())
+                return fail(s, 404, "Video not found");
+
+            Video& video = gVideos[indexIt->second];
+
+            if (!canSee(video, me))
+                return fail(s, 404, "Video not found");
+
+            copy = video;
         }
         if (isStream) return (m == "GET" || m == "HEAD") ? streamFile(s, r, DATA_DIR / "videos" / copy.file, copy.mime) : fail(s, 405, "Method not allowed");
         if (m == "GET") return json(s, 200, videoJson(copy, me));
         if (copy.owner != me) return fail(s, 403, "Only the owner can do that");
-        if (m == "DELETE") {
-            std::lock_guard<std::mutex> g(gMutex);
-            gVideos.erase(std::remove_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == id; }),
-                          gVideos.end());
+            if (m == "DELETE") {
+                std::lock_guard<std::mutex> g(gMutex);
+                gVideos.erase(std::remove_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == id; }),
+                              gVideos.end());
+                gVideoIndex.clear();
+
+                for (size_t i = 0; i < gVideos.size(); ++i) {
+                    gVideoIndex[gVideos[i].id] = i;
+                }
             saveVideos();
             std::error_code ec;
             fs::remove(DATA_DIR / "videos" / copy.file, ec);
@@ -732,8 +812,12 @@ static void route(sock_t s, Req& r) {
             if (!readBody(s, r)) return fail(s, 400, "Bad request body");
             auto f = parseForm(r.body);
             std::lock_guard<std::mutex> g(gMutex);
-            for (auto& v : gVideos) {
-                if (v.id != id) continue;
+            auto indexIt = gVideoIndex.find(id);
+
+            if (indexIt == gVideoIndex.end())
+                return fail(s, 404, "Video not found");
+
+            Video& v = gVideos[indexIt->second];
                 if (f.count("visibility")) {
                     if (f["visibility"] != "public" && f["visibility"] != "private")
                         return fail(s, 400, "visibility must be public or private");
@@ -746,11 +830,10 @@ static void route(sock_t s, Req& r) {
                 }
                 saveVideos();
                 return json(s, 200, videoJson(v, me));
-            }
         }
+
         return fail(s, 405, "Method not allowed");
     }
-
     if (m == "GET") return serveStatic(s, p);
     fail(s, 404, "Not found");
 }
@@ -773,7 +856,28 @@ static void handleConn(sock_t s) {
     }
     CLOSESOCK(s);
 }
+static void workerThread() {
+    while (true) {
+        sock_t s;
 
+        {
+            std::unique_lock<std::mutex> lock(gQueueMutex);
+
+            gQueueCondition.wait(lock, [] {
+                return !gConnectionQueue.empty() || !gServerRunning;
+            });
+
+            if (!gServerRunning && gConnectionQueue.empty()) {
+                return;
+            }
+
+            s = gConnectionQueue.front();
+            gConnectionQueue.pop();
+        }
+
+        handleConn(s);
+    }
+}
 int main(int argc, char** argv) {
     if (argc > 1 && string(argv[1]) == "--selftest") {  // SHA-256 known-answer test
         string h = toHex(sha256("abc"));
@@ -818,9 +922,26 @@ int main(int argc, char** argv) {
         return 1;
     }
     std::cout << "TecFlix running at http://localhost:" << port << "  (Ctrl+C to stop)\n";
+
+    const unsigned int numWorkers =
+        std::max(2u, std::thread::hardware_concurrency());
+
+    std::vector<std::thread> workers;
+    workers.reserve(numWorkers);
+
+    for (unsigned int i = 0; i < numWorkers; ++i) {
+        workers.emplace_back(workerThread);
+    }
+
     while (true) {
         sock_t c = accept(ls, nullptr, nullptr);
         if (c == INVALID_SOCKET) continue;
-        std::thread(handleConn, c).detach();
+
+        {
+            std::lock_guard<std::mutex> lock(gQueueMutex);
+            gConnectionQueue.push(c);
+        }
+
+        gQueueCondition.notify_one();
     }
 }
