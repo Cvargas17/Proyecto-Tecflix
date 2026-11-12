@@ -1,0 +1,31 @@
+
+  services:
+    mongodb:
+      image: mongo:7.0
+      container_name: tecflix-mongodb
+      restart: unless-stopped
+      ports:
+        - "27017:27017"
+      environment:
+        MONGO_INITDB_DATABASE: tecflix
+      volumes:
+        - mongodb_data:/data/db
+      healthcheck:
+        test: [ "CMD", "mongosh", "--eval", "db.adminCommand('ping')" ]
+        interval: 10s
+        timeout: 5s
+        retries: 5
+
+    aspire-dashboard:
+      image: mcr.microsoft.com/dotnet/aspire-dashboard:latest
+      container_name: tecflix-otel-dashboard
+      restart: unless-stopped
+      ports:
+        - "18888:18888" # Interfaz web del Dashboard del Sistema
+        - "4317:18889"  # Receptor OTLP gRPC
+        - "4318:18890"  # Receptor OTLP HTTP (el más fácil de usar desde C++)
+      environment:
+        DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS: "true"
+
+  volumes:
+    mongodb_data:
