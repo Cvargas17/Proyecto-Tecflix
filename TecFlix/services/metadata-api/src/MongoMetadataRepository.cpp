@@ -13,6 +13,9 @@
 #include <bsoncxx/builder/basic/document.hpp>
 #include <bsoncxx/builder/basic/kvp.hpp>
 #include <bsoncxx/types.hpp>
+#include <mongocxx/client.hpp>
+#include <mongocxx/collection.hpp>
+#include <mongocxx/database.hpp>
 #include <mongocxx/exception/exception.hpp>
 #include <mongocxx/options/find.hpp>
 
@@ -187,7 +190,6 @@ PaginatedVideos MongoMetadataRepository::findPaginated(const VideoQueryFilter& f
             result.page = result.totalPages;
         }
 
-        // Ordenamiento por título, autor (owner) o fecha de carga (uploaded)
         std::string sortField = "uploaded";
         if (filter.sortBy == "title") {
             sortField = "title";
