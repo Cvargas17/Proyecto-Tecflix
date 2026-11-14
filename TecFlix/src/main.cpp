@@ -1,28 +1,45 @@
 // TecFlix - a self-contained video sharing web server.
-// C++17, no third-party dependencies (Winsock on Windows, BSD sockets elsewhere).
+// C++17, integrated with MetadataService/MetadataController and OpenTelemetry.
 //
 // Features: accounts, upload, streaming (HTTP Range), delete, public/private
-// visibility, title editing and metadata extraction (MP4/MOV box parser).
-#include <condition_variable>
-#include <queue>
-#include <array>
+// visibility, title/topic/tags editing, metadata extraction (MP4/MOV box parser)
+// and distributed observability (OTLP/HTTP).
+
+#include "IMetadataRepository.hpp"
+#include "MetadataController.hpp"
+#include "MetadataService.hpp"
+#include "TelemetryManager.hpp"
+
+#ifdef TECFLIX_USE_MONGODB
+#include "MongoMetadataRepository.hpp"
+#include <mongocxx/instance.hpp>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
+#include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+
 #ifdef _WIN32
 #include <winsock2.h>
 #include <ws2tcpip.h>
@@ -35,7 +52,6 @@ using sock_t = SOCKET;
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <semaphore>
 using sock_t = int;
 #define INVALID_SOCKET (-1)
 #define CLOSESOCK close
@@ -54,6 +70,10 @@ static string gFfmpeg;                  // path to ffmpeg; empty when DASH packa
 
 // ---------------------------------------------------------------- utilities
 
+static string getEnvOrDefault(const char* name, const string& def) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? string(v) : def;
+}
 static string lower(string s) {
     for (auto& c : s) c = (char)tolower((unsigned char)c);
     return s;
@@ -65,7 +85,7 @@ static string trim(const string& s) {
 static string urldecode(const string& s) {
     string o;
     for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '%' && i + 2 < s.size() + 0 && isxdigit((unsigned char)s[i + 1]) &&
+        if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) &&
             isxdigit((unsigned char)s[i + 2])) {
             o += (char)std::stoi(s.substr(i + 1, 2), nullptr, 16);
             i += 2;
@@ -111,6 +131,19 @@ static string jstr(const string& s) {
         }
     }
     return o + "\"";
+}
+static string formBodyToJson(const string& formBody) {
+    auto f = parseForm(formBody);
+    std::ostringstream oss;
+    oss << "{";
+    bool first = true;
+    for (const auto& [k, v] : f) {
+        if (!first) oss << ",";
+        oss << jstr(k) << ":" << jstr(v);
+        first = false;
+    }
+    oss << "}";
+    return oss.str();
 }
 static string randHex(int bytes) {
     static std::random_device rd;
@@ -201,6 +234,8 @@ struct Video {
     int width = 0, height = 0, tracks = 0;
     string vcodec, acodec, brand;
     string dash = "unavailable";  // unavailable | processing | ready | failed
+    string topic;
+    vector<string> tags;
 };
 struct User {
     string name, salt, hash;
@@ -214,7 +249,12 @@ static std::unordered_map<std::string, size_t> gVideoIndex;
 static std::mutex gQueueMutex;
 static std::condition_variable gQueueCondition;
 static std::queue<sock_t> gConnectionQueue;
-static bool gServerRunning = true;
+static std::atomic<bool> gServerRunning{true};
+static sock_t gListenSocket = INVALID_SOCKET;
+
+// Instancias globales del microservicio de Metadata
+static std::shared_ptr<tecflix::metadata::MetadataService> gMetadataService;
+static std::shared_ptr<tecflix::metadata::MetadataController> gMetadataController;
 
 static string clean(string s) {
     for (auto& c : s)
@@ -261,12 +301,171 @@ static void loadDb() {
         x.duration = std::stod(f[10]); x.width = std::stoi(f[11]); x.height = std::stoi(f[12]);
         x.tracks = std::stoi(f[13]); x.vcodec = f[14]; x.acodec = f[15]; x.brand = f[16];
         if (f.size() > 17) x.dash = f[17];
-        if (x.dash == "processing") x.dash = "failed";// server stopped mid-packaging
+        if (x.dash == "processing") x.dash = "failed";  // server stopped mid-packaging
 
         gVideos.push_back(x);
         gVideoIndex[x.id] = gVideos.size() - 1;
     }
 }
+
+// ---------------------------------------------- MetadataRepository Adapter
+
+namespace {
+
+std::string mapDashStateForMetadata(const std::string& rawDash) {
+    if (rawDash == "ready") return "ready";
+    if (rawDash == "processing") return "processing";
+    if (rawDash == "failed" || rawDash == "error") return "error";
+    return "pending";
+}
+
+tecflix::metadata::VideoMetadata toDomainMetadata(const Video& v) {
+    tecflix::metadata::VideoMetadata m;
+    m.id = v.id;
+    m.owner = v.owner;
+    m.title = v.title;
+    m.topic = v.topic;
+    m.tags = v.tags;
+    m.visibility = (v.visibility == "private") ? "private" : "public";
+    m.file = v.file;
+    m.dash = mapDashStateForMetadata(v.dash);
+    m.duration = v.duration;
+    m.sizeBytes = static_cast<int64_t>(v.size);
+    m.uploaded = v.uploaded;
+    return m;
+}
+
+/**
+ * @class EmbeddedMetadataRepository
+ * @brief Adaptador de `IMetadataRepository` respaldado por `gVideos`/`videos.db` cuando
+ *        el binario se compila sin `libmongocxx` (ej. entorno local Windows MinGW).
+ */
+class EmbeddedMetadataRepository : public tecflix::metadata::IMetadataRepository {
+public:
+    bool create(const tecflix::metadata::VideoMetadata& video) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(video.id);
+        if (it != gVideoIndex.end()) {
+            Video& existing = gVideos[it->second];
+            existing.title = video.title;
+            existing.topic = video.topic;
+            existing.tags = video.tags;
+            existing.visibility = video.visibility;
+            existing.duration = video.duration;
+            if (video.sizeBytes > 0) existing.size = static_cast<uint64_t>(video.sizeBytes);
+            saveVideos();
+            return true;
+        }
+        Video v;
+        v.id = video.id;
+        v.owner = video.owner;
+        v.title = video.title;
+        v.topic = video.topic;
+        v.tags = video.tags;
+        v.visibility = video.visibility;
+        v.file = video.file;
+        v.dash = video.dash;
+        v.duration = video.duration;
+        v.size = static_cast<uint64_t>(std::max<int64_t>(0, video.sizeBytes));
+        v.uploaded = video.uploaded;
+        gVideos.push_back(v);
+        gVideoIndex[v.id] = gVideos.size() - 1;
+        saveVideos();
+        return true;
+    }
+
+    std::optional<tecflix::metadata::VideoMetadata> findById(const std::string& videoId) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(videoId);
+        if (it == gVideoIndex.end()) return std::nullopt;
+        return toDomainMetadata(gVideos[it->second]);
+    }
+
+    tecflix::metadata::PaginatedVideos findPaginated(
+        const tecflix::metadata::VideoQueryFilter& filter) override {
+        std::vector<tecflix::metadata::VideoMetadata> filtered;
+        {
+            std::lock_guard<std::mutex> g(gMutex);
+            for (const auto& vid : gVideos) {
+                if (filter.scope == "mine") {
+                    if (vid.owner != filter.requesterUsername) continue;
+                } else {
+                    if (vid.visibility == "private" && vid.owner != filter.requesterUsername) continue;
+                }
+                if (!filter.topicFilter.empty() && vid.topic != filter.topicFilter) continue;
+                if (!filter.tagFilter.empty()) {
+                    bool hasTag = std::find(vid.tags.begin(), vid.tags.end(), filter.tagFilter) != vid.tags.end();
+                    if (!hasTag) continue;
+                }
+                filtered.push_back(toDomainMetadata(vid));
+            }
+        }
+
+        bool asc = (filter.order == "asc");
+        std::sort(filtered.begin(), filtered.end(),
+                  [&](const tecflix::metadata::VideoMetadata& a,
+                      const tecflix::metadata::VideoMetadata& b) {
+                      if (filter.sortBy == "title") {
+                          return asc ? (a.title < b.title) : (a.title > b.title);
+                      }
+                      if (filter.sortBy == "owner" || filter.sortBy == "author") {
+                          return asc ? (a.owner < b.owner) : (a.owner > b.owner);
+                      }
+                      return asc ? (a.uploaded < b.uploaded) : (a.uploaded > b.uploaded);
+                  });
+
+        int totalItems = static_cast<int>(filtered.size());
+        int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(totalItems) / filter.limit)));
+        int page = std::clamp(filter.page, 1, totalPages);
+
+        size_t startIdx = static_cast<size_t>((page - 1) * filter.limit);
+        size_t endIdx = std::min(filtered.size(), startIdx + static_cast<size_t>(filter.limit));
+
+        std::vector<tecflix::metadata::VideoMetadata> pageItems;
+        if (startIdx < filtered.size()) {
+            pageItems.assign(filtered.begin() + startIdx, filtered.begin() + endIdx);
+        }
+
+        return tecflix::metadata::PaginatedVideos{pageItems, page, filter.limit, totalPages, totalItems};
+    }
+
+    bool update(const tecflix::metadata::VideoMetadata& video) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(video.id);
+        if (it == gVideoIndex.end()) return false;
+        Video& v = gVideos[it->second];
+        v.title = video.title;
+        v.topic = video.topic;
+        v.tags = video.tags;
+        v.visibility = video.visibility;
+        saveVideos();
+        return true;
+    }
+
+    bool updateDashStatus(const std::string& videoId, const std::string& dashStatus) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(videoId);
+        if (it == gVideoIndex.end()) return false;
+        gVideos[it->second].dash = (dashStatus == "error") ? "failed" : dashStatus;
+        saveVideos();
+        return true;
+    }
+
+    bool remove(const std::string& videoId) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(videoId);
+        if (it == gVideoIndex.end()) return false;
+        gVideos.erase(gVideos.begin() + static_cast<std::ptrdiff_t>(it->second));
+        gVideoIndex.clear();
+        for (size_t i = 0; i < gVideos.size(); ++i) {
+            gVideoIndex[gVideos[i].id] = i;
+        }
+        saveVideos();
+        return true;
+    }
+};
+
+}  // namespace
 
 // ------------------------------------------------------------ MP4 metadata
 
@@ -467,6 +666,9 @@ static bool readBody(sock_t s, Req& r) {
 // ---------------------------------------------------------------- sessions
 
 static string sessionUser(const Req& r) {
+    if (auto hdr = r.h.find("x-user"); hdr != r.h.end() && !hdr->second.empty()) {
+        return hdr->second;
+    }
     auto it = r.h.find("cookie");
     if (it == r.h.end()) return "";
     size_t p = it->second.find("tf_session=");
@@ -529,23 +731,20 @@ static int gDashActive = 0;
 static const int MAX_DASH_JOBS = 2;
 
 static void packageDash(Video v) {  // runs on a worker thread
+    tecflix::observability::ScopedSpan span("ffmpeg.packageDash", "", {{"video.id", v.id}});
     {
         std::unique_lock<std::mutex> lock(gDashMutex);
-
         gDashCondition.wait(lock, [] {
             return gDashActive < MAX_DASH_JOBS;
         });
-
         ++gDashActive;
     }
     std::error_code ec;
     fs::path in = fs::absolute(DATA_DIR / "videos" / v.file, ec);
     fs::path out = fs::absolute(DATA_DIR / "dash" / v.id, ec);
     fs::create_directories(out, ec);
-    // Re-use H.264 / AAC streams as they are; otherwise transcode to browser-friendly codecs.
     string vc = v.vcodec == "avc1" ? "copy" : "libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -g 96 -sc_threshold 0";
     string ac = v.acodec == "mp4a" ? "copy" : "aac -b:a 128k";
-    // ffmpeg writes segment files relative to its working directory, so run it inside the output folder.
 #ifdef _WIN32
     string cd = "cd /d \"" + out.string() + "\" && ";
 #else
@@ -561,24 +760,23 @@ static void packageDash(Video v) {  // runs on a worker thread
     bool found = false;
     {
         std::lock_guard<std::mutex> g(gMutex);
-
         auto indexIt = gVideoIndex.find(v.id);
-
         if (indexIt != gVideoIndex.end()) {
             Video& x = gVideos[indexIt->second];
             x.dash = ok ? "ready" : "failed";
             found = true;
         }
-
-        if (found)
-            saveVideos();
+        if (found) saveVideos();
+    }
+    if (found && gMetadataService) {
+        gMetadataService->updateDashState(v.id, ok ? "ready" : "error");
     }
     if (!ok || !found) fs::remove_all(out, ec);  // failed, or the video was deleted meanwhile
+    span.setStatusCode(ok ? 200 : 500);
     {
         std::lock_guard<std::mutex> lock(gDashMutex);
         --gDashActive;
     }
-
     gDashCondition.notify_one();
 }
 
@@ -612,14 +810,21 @@ static void handleUpload(sock_t s, Req& r, const string& me) {
     v.id = id; v.owner = me; v.title = title; v.file = file; v.orig = clean(orig); v.mime = mime;
     v.visibility = r.q["visibility"] == "public" ? "public" : "private";
     v.uploaded = (int64_t)time(nullptr);
+    v.topic = trim(clean(r.q["topic"]));
     probe(v, path);
     if (!gFfmpeg.empty()) v.dash = "processing";
-    std::lock_guard<std::mutex> g(gMutex);
 
-    gVideos.push_back(v);
-    gVideoIndex[v.id] = gVideos.size() - 1;
+    {
+        std::lock_guard<std::mutex> g(gMutex);
+        gVideos.push_back(v);
+        gVideoIndex[v.id] = gVideos.size() - 1;
+        saveVideos();
+    }
 
-    saveVideos();
+    // Sincronizar registro en MetadataService (MongoDB en producción / repositorio embebido en local)
+    if (gMetadataService) {
+        gMetadataService->registerVideo(toDomainMetadata(v));
+    }
 
     if (!gFfmpeg.empty())
         std::thread(packageDash, v).detach();
@@ -692,6 +897,60 @@ static void route(sock_t s, Req& r) {
     const string& p = r.path;
     const string& m = r.method;
 
+    // Delegar endpoints de Metadata API al controlador dedicado (con soporte de paginación, filtros y MongoDB)
+    if (gMetadataController && (p == "/api/videos" || p.rfind("/api/videos/", 0) == 0)) {
+        if (r.clen > 0 && !readBody(s, r)) {
+            return fail(s, 400, "Bad request body");
+        }
+
+        tecflix::metadata::HttpRequest metaReq;
+        metaReq.method = m;
+        metaReq.path = p;
+        metaReq.queryParams = r.q;
+        metaReq.headers = r.h;
+        if (!me.empty()) {
+            metaReq.headers["x-user"] = me;
+        }
+
+        // Compatibilidad con POST /api/videos/<id> en formato formulario usado por el frontend
+        if (p.rfind("/api/videos/", 0) == 0 && m == "POST") {
+            metaReq.method = "PATCH";
+            metaReq.body = (!r.body.empty() && r.body.front() != '{') ? formBodyToJson(r.body) : r.body;
+        } else {
+            metaReq.body = r.body;
+        }
+
+        // Capturar ruta de archivo físico antes de un DELETE para limpiar disco tras borrar metadata
+        string deletedFile;
+        string deletedId;
+        if (m == "DELETE" && p.rfind("/api/videos/", 0) == 0) {
+            deletedId = p.substr(12);
+            std::lock_guard<std::mutex> g(gMutex);
+            auto idxIt = gVideoIndex.find(deletedId);
+            if (idxIt != gVideoIndex.end()) {
+                deletedFile = gVideos[idxIt->second].file;
+            }
+        }
+
+        auto res = gMetadataController->handleRequest(metaReq);
+
+        if (m == "DELETE" && res.statusCode == 200 && !deletedId.empty()) {
+            std::error_code ec;
+            if (!deletedFile.empty()) fs::remove(DATA_DIR / "videos" / deletedFile, ec);
+            fs::remove_all(DATA_DIR / "dash" / deletedId, ec);
+        }
+
+        return json(s, res.statusCode, res.jsonBody);
+    }
+
+    // Span de observabilidad para el resto de endpoints del servidor
+    string traceId = r.h.count("x-trace-id") ? r.h["x-trace-id"] : "";
+    tecflix::observability::ScopedSpan span(m + " " + p, traceId, {{"http.method", m}, {"http.route", p}});
+
+    if (p == "/health" && m == "GET") {
+        span.setStatusCode(200);
+        return json(s, 200, "{\"status\":\"healthy\",\"service\":\"tecflix-server\"}");
+    }
     if (p == "/api/register" && m == "POST") return handleAuth(s, r, true);
     if (p == "/api/login" && m == "POST") return handleAuth(s, r, false);
     if (p == "/api/logout" && m == "POST") {
@@ -710,36 +969,6 @@ static void route(sock_t s, Req& r) {
         return json(s, 200, me.empty() ? "{\"username\":null}" : "{\"username\":" + jstr(me) + "}");
     if (p == "/api/upload" && m == "POST") return handleUpload(s, r, me);
 
-    if (p == "/api/videos" && m == "GET") {
-        bool mine = r.q["scope"] == "mine";
-
-        if (mine && me.empty())
-            return fail(s, 401, "Log in first");
-
-        vector<Video> videosCopy;
-
-        {
-            std::lock_guard<std::mutex> g(gMutex);
-
-            for (auto it = gVideos.rbegin(); it != gVideos.rend(); ++it) {
-                if (mine ? it->owner != me : it->visibility != "public")
-                    continue;
-
-                videosCopy.push_back(*it);
-            }
-        }
-
-        string out = "[";
-        bool first = true;
-
-        for (const auto& video : videosCopy) {
-            out += (first ? "" : ",") + videoJson(video, me);
-            first = false;
-        }
-
-        return json(s, 200, out + "]");
-    }
-
     // /dash/<id>/<file>: manifest and segments of a packaged video
     if (p.rfind("/dash/", 0) == 0 && (m == "GET" || m == "HEAD")) {
         string rest = p.substr(6);
@@ -748,93 +977,40 @@ static void route(sock_t s, Req& r) {
         bool okName = !name.empty() && name.find("..") == string::npos &&
                       std::all_of(name.begin(), name.end(),
                                   [](unsigned char c) { return isalnum(c) || c == '.' || c == '_' || c == '-'; });
-        if (!isHexId(did) || !okName) return fail(s, 404, "Not found");
+        if (!isHexId(did) || !okName) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
         {
             std::lock_guard<std::mutex> g(gMutex);
-
             auto indexIt = gVideoIndex.find(did);
-
-            if (indexIt == gVideoIndex.end())
-                return fail(s, 404, "Not found");
-
+            if (indexIt == gVideoIndex.end()) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
             Video& video = gVideos[indexIt->second];
-
-            if (!canSee(video, me) || video.dash != "ready")
-                return fail(s, 404, "Not found");
+            if (!canSee(video, me) || video.dash != "ready") { span.setStatusCode(404); return fail(s, 404, "Not found"); }
         }
         string ext = lower(fs::path(name).extension().string());
         return streamFile(s, r, DATA_DIR / "dash" / did / name, ext == ".mpd" ? "application/dash+xml" : "video/mp4");
     }
 
-    // /api/videos/<id>  and  /video/<id>
-    string id;
-    bool isApi = p.rfind("/api/videos/", 0) == 0, isStream = p.rfind("/video/", 0) == 0;
-    if (isApi) id = p.substr(12);
-    else if (isStream) id = p.substr(7);
-    if (isApi || isStream) {
-        if (!isHexId(id)) return fail(s, 404, "Not found");
-
+    // /video/<id>: streaming directo por rangos HTTP
+    if (p.rfind("/video/", 0) == 0) {
+        string id = p.substr(7);
+        if (!isHexId(id)) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
         Video copy;
         {
             std::lock_guard<std::mutex> g(gMutex);
-
             auto indexIt = gVideoIndex.find(id);
-
-            if (indexIt == gVideoIndex.end())
-                return fail(s, 404, "Video not found");
-
+            if (indexIt == gVideoIndex.end()) { span.setStatusCode(404); return fail(s, 404, "Video not found"); }
             Video& video = gVideos[indexIt->second];
-
-            if (!canSee(video, me))
-                return fail(s, 404, "Video not found");
-
+            if (!canSee(video, me)) { span.setStatusCode(404); return fail(s, 404, "Video not found"); }
             copy = video;
         }
-        if (isStream) return (m == "GET" || m == "HEAD") ? streamFile(s, r, DATA_DIR / "videos" / copy.file, copy.mime) : fail(s, 405, "Method not allowed");
-        if (m == "GET") return json(s, 200, videoJson(copy, me));
-        if (copy.owner != me) return fail(s, 403, "Only the owner can do that");
-            if (m == "DELETE") {
-                std::lock_guard<std::mutex> g(gMutex);
-                gVideos.erase(std::remove_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == id; }),
-                              gVideos.end());
-                gVideoIndex.clear();
-
-                for (size_t i = 0; i < gVideos.size(); ++i) {
-                    gVideoIndex[gVideos[i].id] = i;
-                }
-            saveVideos();
-            std::error_code ec;
-            fs::remove(DATA_DIR / "videos" / copy.file, ec);
-            fs::remove_all(DATA_DIR / "dash" / id, ec);
-            return json(s, 200, "{}");
+        if (m == "GET" || m == "HEAD") {
+            return streamFile(s, r, DATA_DIR / "videos" / copy.file, copy.mime);
         }
-        if (m == "POST") {  // update title and/or visibility
-            if (!readBody(s, r)) return fail(s, 400, "Bad request body");
-            auto f = parseForm(r.body);
-            std::lock_guard<std::mutex> g(gMutex);
-            auto indexIt = gVideoIndex.find(id);
-
-            if (indexIt == gVideoIndex.end())
-                return fail(s, 404, "Video not found");
-
-            Video& v = gVideos[indexIt->second];
-                if (f.count("visibility")) {
-                    if (f["visibility"] != "public" && f["visibility"] != "private")
-                        return fail(s, 400, "visibility must be public or private");
-                    v.visibility = f["visibility"];
-                }
-                if (f.count("title")) {
-                    string t = trim(clean(f["title"]));
-                    if (t.empty() || t.size() > 120) return fail(s, 400, "Title must be 1-120 characters");
-                    v.title = t;
-                }
-                saveVideos();
-                return json(s, 200, videoJson(v, me));
-        }
-
+        span.setStatusCode(405);
         return fail(s, 405, "Method not allowed");
     }
+
     if (m == "GET") return serveStatic(s, p);
+    span.setStatusCode(404);
     fail(s, 404, "Not found");
 }
 
@@ -859,25 +1035,29 @@ static void handleConn(sock_t s) {
 static void workerThread() {
     while (true) {
         sock_t s;
-
         {
             std::unique_lock<std::mutex> lock(gQueueMutex);
-
             gQueueCondition.wait(lock, [] {
-                return !gConnectionQueue.empty() || !gServerRunning;
+                return !gConnectionQueue.empty() || !gServerRunning.load();
             });
-
-            if (!gServerRunning && gConnectionQueue.empty()) {
+            if (!gServerRunning.load() && gConnectionQueue.empty()) {
                 return;
             }
-
             s = gConnectionQueue.front();
             gConnectionQueue.pop();
         }
-
         handleConn(s);
     }
 }
+static void onShutdownSignal(int /*sig*/) {
+    gServerRunning.store(false);
+    if (gListenSocket != INVALID_SOCKET) {
+        CLOSESOCK(gListenSocket);
+        gListenSocket = INVALID_SOCKET;
+    }
+    gQueueCondition.notify_all();
+}
+
 int main(int argc, char** argv) {
     if (argc > 1 && string(argv[1]) == "--selftest") {  // SHA-256 known-answer test
         string h = toHex(sha256("abc"));
@@ -885,9 +1065,37 @@ int main(int argc, char** argv) {
                   << (h == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" ? "OK" : "FAIL") << "\n";
         return 0;
     }
-    int port = argc > 1 ? std::atoi(argv[1]) : 8080;
+    int port = argc > 1 ? std::atoi(argv[1]) : std::stoi(getEnvOrDefault("PORT", "8080"));
+    const string otlpHost = getEnvOrDefault("OTLP_HOST", "127.0.0.1");
+    const int otlpPort = std::stoi(getEnvOrDefault("OTLP_PORT", "4318"));
+
+    std::signal(SIGINT, onShutdownSignal);
+    std::signal(SIGTERM, onShutdownSignal);
+
+    // Inicializar telemetría distribuida OpenTelemetry (Aspire Dashboard)
+    tecflix::observability::TelemetryManager::instance().init("tecflix-server", otlpHost, otlpPort);
+
     fs::create_directories(DATA_DIR / "videos");
     loadDb();
+
+    // Inicializar capa de Metadata API (MongoDB en despliegue o repositorio embebido en local)
+#ifdef TECFLIX_USE_MONGODB
+    mongocxx::instance mongoInstance{};
+    const string mongoUri = getEnvOrDefault("MONGO_URI", "mongodb://localhost:27017");
+    const string mongoDb = getEnvOrDefault("MONGO_DB", "tecflix");
+    const string mongoColl = getEnvOrDefault("MONGO_COLLECTION", "videos");
+    auto metaRepo = std::make_shared<tecflix::metadata::MongoMetadataRepository>(mongoUri, mongoDb, mongoColl);
+    for (const auto& v : gVideos) {
+        if (!metaRepo->findById(v.id)) {
+            metaRepo->create(toDomainMetadata(v));
+        }
+    }
+#else
+    auto metaRepo = std::make_shared<EmbeddedMetadataRepository>();
+#endif
+    gMetadataService = std::make_shared<tecflix::metadata::MetadataService>(metaRepo);
+    gMetadataController = std::make_shared<tecflix::metadata::MetadataController>(gMetadataService);
+
     {   // DASH packaging needs ffmpeg: TECFLIX_FFMPEG, or "ffmpeg" from PATH
         const char* env = std::getenv("TECFLIX_FFMPEG");
         string cand = env && *env ? env : "ffmpeg";
@@ -911,6 +1119,7 @@ int main(int argc, char** argv) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
     sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    gListenSocket = ls;
     int yes = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
     sockaddr_in a{};
@@ -919,29 +1128,40 @@ int main(int argc, char** argv) {
     a.sin_port = htons((unsigned short)port);
     if (bind(ls, (sockaddr*)&a, sizeof a) != 0 || listen(ls, 64) != 0) {
         std::cerr << "Cannot listen on port " << port << "\n";
+        tecflix::observability::TelemetryManager::instance().shutdown();
         return 1;
     }
     std::cout << "TecFlix running at http://localhost:" << port << "  (Ctrl+C to stop)\n";
 
-    const unsigned int numWorkers =
-        std::max(2u, std::thread::hardware_concurrency());
-
+    const unsigned int numWorkers = std::max(2u, std::thread::hardware_concurrency());
     std::vector<std::thread> workers;
     workers.reserve(numWorkers);
-
     for (unsigned int i = 0; i < numWorkers; ++i) {
         workers.emplace_back(workerThread);
     }
 
-    while (true) {
+    while (gServerRunning.load()) {
         sock_t c = accept(ls, nullptr, nullptr);
-        if (c == INVALID_SOCKET) continue;
-
+        if (c == INVALID_SOCKET) {
+            if (!gServerRunning.load()) break;
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lock(gQueueMutex);
             gConnectionQueue.push(c);
         }
-
         gQueueCondition.notify_one();
     }
+
+    gServerRunning.store(false);
+    gQueueCondition.notify_all();
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
+    }
+
+    tecflix::observability::TelemetryManager::instance().shutdown();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
 }
