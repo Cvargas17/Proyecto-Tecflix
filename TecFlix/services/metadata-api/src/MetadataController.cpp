@@ -63,6 +63,34 @@ std::string MetadataController::extractJsonString(const std::string& json, const
     return "";
 }
 
+double MetadataController::extractJsonNumber(const std::string& json, const std::string& key, double defaultVal) {
+    std::string needle = "\"" + key + "\"";
+    size_t pos = json.find(needle);
+    if (pos == std::string::npos) return defaultVal;
+
+    size_t colon = json.find(':', pos + needle.size());
+    if (colon == std::string::npos) return defaultVal;
+
+    size_t start = colon + 1;
+    while (start < json.size() && std::isspace(static_cast<unsigned char>(json[start]))) {
+        ++start;
+    }
+    if (start >= json.size()) return defaultVal;
+
+    size_t end = start;
+    while (end < json.size() &&
+           (std::isdigit(static_cast<unsigned char>(json[end])) || json[end] == '.' || json[end] == '-')) {
+        ++end;
+    }
+    if (end == start) return defaultVal;
+
+    try {
+        return std::stod(json.substr(start, end - start));
+    } catch (...) {
+        return defaultVal;
+    }
+}
+
 std::vector<std::string> MetadataController::extractJsonStringArray(const std::string& json, const std::string& key) {
     std::vector<std::string> items;
     std::string needle = "\"" + key + "\"";
@@ -89,7 +117,6 @@ std::vector<std::string> MetadataController::extractJsonStringArray(const std::s
 }
 
 ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
-    // Propagación de traza distribuida recibida desde el API Gateway
     std::string incomingTraceId = getHeaderIgnoreCase(req.headers, "X-Trace-Id");
     observability::ScopedSpan span(req.method + " " + req.path, incomingTraceId,
                                    {{"http.method", req.method}, {"http.route", req.path}});
@@ -97,12 +124,9 @@ ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
     std::string requester = getHeaderIgnoreCase(req.headers, "X-User");
     ServiceResponse response{404, "{\"error\":\"Endpoint not found\"}"};
 
-    // 1. Verificación de salud del microservicio
     if (req.method == "GET" && req.path == "/health") {
         response = {200, "{\"status\":\"healthy\",\"service\":\"tecflix-metadata-api\"}"};
-    }
-    // 2. Consulta paginada y filtrada del catálogo
-    else if (req.method == "GET" && req.path == "/api/videos") {
+    } else if (req.method == "GET" && req.path == "/api/videos") {
         VideoQueryFilter filter;
         filter.requesterUsername = requester;
         if (req.queryParams.count("scope")) filter.scope = req.queryParams.at("scope");
@@ -117,9 +141,7 @@ ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
             try { filter.limit = std::stoi(req.queryParams.at("limit")); } catch (...) {}
         }
         response = service_->listVideos(filter);
-    }
-    // 3. Registro de metadatos de un video nuevo
-    else if (req.method == "POST" && req.path == "/api/videos") {
+    } else if (req.method == "POST" && req.path == "/api/videos") {
         VideoMetadata video;
         video.id = extractJsonString(req.body, "id");
         video.owner = requester.empty() ? extractJsonString(req.body, "owner") : requester;
@@ -129,14 +151,14 @@ ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
         video.visibility = extractJsonString(req.body, "visibility");
         video.file = extractJsonString(req.body, "file");
         video.dash = extractJsonString(req.body, "dash");
+        video.duration = extractJsonNumber(req.body, "duration", 0.0);
+        video.sizeBytes = static_cast<int64_t>(extractJsonNumber(req.body, "sizeBytes", 0.0));
         video.uploaded = static_cast<int64_t>(
             std::chrono::duration_cast<std::chrono::seconds>(
                 std::chrono::system_clock::now().time_since_epoch()).count());
         response = service_->registerVideo(std::move(video));
-    }
-    // 4. Rutas parametrizadas por identificador: /api/videos/{id} y /api/videos/{id}/dash
-    else if (req.path.rfind("/api/videos/", 0) == 0) {
-        std::string sub = req.path.substr(12); // Extrae el segmento posterior a "/api/videos/"
+    } else if (req.path.rfind("/api/videos/", 0) == 0) {
+        std::string sub = req.path.substr(12);
         size_t slashPos = sub.find('/');
 
         if (slashPos == std::string::npos) {

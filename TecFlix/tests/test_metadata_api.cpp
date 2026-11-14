@@ -2,8 +2,9 @@
  * @file test_metadata_api.cpp
  * @brief Suite de pruebas unitarias para el microservicio de Metadata de TecFlix.
  * @details Valida las reglas de dominio de `MetadataService`, el enrutamiento HTTP y parsing
- *          JSON de `MetadataController`, la serialización de `VideoMetadata` y la generación
- *          de trazas/métricas en `TelemetryManager` mediante un repositorio simulado (`MockMetadataRepository`).
+ *          JSON de `MetadataController`, la serialización de `VideoMetadata` (incluyendo
+ *          duración, tamaño en bytes y ordenamiento por autor) y la telemetría en `TelemetryManager`
+ *          mediante un repositorio simulado (`MockMetadataRepository`).
  */
 
 #include "IMetadataRepository.hpp"
@@ -27,8 +28,8 @@ using namespace tecflix::observability;
 /**
  * @class MockMetadataRepository
  * @brief Implementación en memoria de `IMetadataRepository` para pruebas unitarias aisladas.
- * @details Simula almacenamiento, filtrado por visibilidad/tema/etiqueta, ordenamiento,
- *          paginación y fallos controlados de base de datos (`simulateDbFailure`).
+ * @details Simula almacenamiento, filtrado por visibilidad/tema/etiqueta, ordenamiento por
+ *          título/autor/fecha, paginación y fallos controlados de base de datos (`simulateDbFailure`).
  */
 class MockMetadataRepository : public IMetadataRepository {
 public:
@@ -72,11 +73,14 @@ public:
             filtered.push_back(vid);
         }
 
-        // Ordenamiento por título o fecha de subida
+        // Ordenamiento por título, autor (owner/author) o fecha de subida
         bool asc = (filter.order == "asc");
         std::sort(filtered.begin(), filtered.end(), [&](const VideoMetadata& a, const VideoMetadata& b) {
             if (filter.sortBy == "title") {
                 return asc ? (a.title < b.title) : (a.title > b.title);
+            }
+            if (filter.sortBy == "owner" || filter.sortBy == "author") {
+                return asc ? (a.owner < b.owner) : (a.owner > b.owner);
             }
             return asc ? (a.uploaded < b.uploaded) : (a.uploaded > b.uploaded);
         });
@@ -121,27 +125,29 @@ private:
 };
 
 /**
- * @brief Prueba el registro de videos válidos e inválidos (campos faltantes, visibilidad inválida, fallo BD).
+ * @brief Prueba el registro de videos válidos e inválidos (duración, tamaño, campos faltantes, fallo BD).
  */
 void testVideoRegistration() {
     auto repo = std::make_shared<MockMetadataRepository>();
     auto service = std::make_shared<MetadataService>(repo);
     MetadataController controller(service);
 
-    // 1. Registro exitoso mediante controlador REST
+    // 1. Registro exitoso con duración y tamaño en bytes
     HttpRequest createReq{
         "POST",
         "/api/videos",
         {},
         {{"X-User", "fabrizio"}, {"X-Trace-Id", "1234567890abcdef1234567890abcdef"}},
-        R"({"id":"vid_001","title":"Arquitectura Microservicios","topic":"Sistemas","tags":["c++","docker"],"visibility":"public","file":"vid_001.mp4"})"
+        R"({"id":"vid_001","title":"Arquitectura Microservicios","topic":"Sistemas","tags":["c++","docker"],"visibility":"public","file":"vid_001.mp4","duration":125.5,"sizeBytes":10485760})"
     };
     ServiceResponse res = controller.handleRequest(createReq);
     assert(res.statusCode == 201);
     assert(res.jsonBody.find("\"id\":\"vid_001\"") != std::string::npos);
+    assert(res.jsonBody.find("\"duration\":125.5") != std::string::npos);
+    assert(res.jsonBody.find("\"sizeBytes\":10485760") != std::string::npos);
     assert(res.jsonBody.find("\"canEdit\":true") != std::string::npos);
 
-    // 2. Registro con valores por defecto (sin visibility ni dash explícitos)
+    // 2. Registro con valores por defecto (sin visibility, dash, duration ni sizeBytes explícitos)
     HttpRequest defaultReq{
         "POST",
         "/api/videos",
@@ -153,6 +159,8 @@ void testVideoRegistration() {
     assert(resDefault.statusCode == 201);
     assert(resDefault.jsonBody.find("\"visibility\":\"public\"") != std::string::npos);
     assert(resDefault.jsonBody.find("\"dash\":\"pending\"") != std::string::npos);
+    assert(resDefault.jsonBody.find("\"duration\":0") != std::string::npos);
+    assert(resDefault.jsonBody.find("\"sizeBytes\":0") != std::string::npos);
 
     // 3. Error 400 por falta de campos obligatorios
     HttpRequest badReq{"POST", "/api/videos", {}, {{"X-User", "fabrizio"}}, R"({"id":"vid_003"})"};
@@ -182,7 +190,7 @@ void testVideoRegistration() {
 }
 
 /**
- * @brief Prueba consultas individuales, permisos de privacidad (403), listados paginados y filtros.
+ * @brief Prueba consultas individuales, permisos de privacidad (403), ordenamiento por autor y filtros.
  */
 void testQueryAndPrivacyRules() {
     auto repo = std::make_shared<MockMetadataRepository>();
@@ -191,11 +199,11 @@ void testQueryAndPrivacyRules() {
 
     // Poblar catálogo con videos públicos y privados
     controller.handleRequest({"POST", "/api/videos", {}, {{"X-User", "fabrizio"}},
-                              R"({"id":"v1","title":"Alpha C++","topic":"Programacion","tags":["cpp"],"visibility":"public"})"});
+                              R"({"id":"v1","title":"Alpha C++","topic":"Programacion","tags":["cpp"],"visibility":"public","duration":60})"});
     controller.handleRequest({"POST", "/api/videos", {}, {{"X-User", "fabrizio"}},
-                              R"({"id":"v2","title":"Borrador Privado","topic":"Programacion","tags":["interno"],"visibility":"private"})"});
+                              R"({"id":"v2","title":"Borrador Privado","topic":"Programacion","tags":["interno"],"visibility":"private","duration":90})"});
     controller.handleRequest({"POST", "/api/videos", {}, {{"X-User", "carlos"}},
-                              R"({"id":"v3","title":"Redes Avanzadas","topic":"Redes","tags":["tcp"],"visibility":"public"})"});
+                              R"({"id":"v3","title":"Redes Avanzadas","topic":"Redes","tags":["tcp"],"visibility":"public","duration":240})"});
 
     // 1. Consulta de video público por usuario anónimo -> 200 OK y canEdit:false
     ServiceResponse pubRes = controller.handleRequest({"GET", "/api/videos/v1", {}, {}, ""});
@@ -232,6 +240,14 @@ void testQueryAndPrivacyRules() {
     assert(filteredRes.statusCode == 200);
     assert(filteredRes.jsonBody.find("\"totalItems\":1") != std::string::npos);
     assert(filteredRes.jsonBody.find("\"id\":\"v3\"") != std::string::npos);
+
+    // 9. Ordenamiento ascendente por autor ("author" -> carlos aparece antes que fabrizio)
+    ServiceResponse sortedByAuthor = controller.handleRequest(
+        {"GET", "/api/videos", {{"scope", "all"}, {"sortBy", "author"}, {"order", "asc"}}, {}, ""});
+    assert(sortedByAuthor.statusCode == 200);
+    size_t posCarlos = sortedByAuthor.jsonBody.find("\"owner\":\"carlos\"");
+    size_t posFabrizio = sortedByAuthor.jsonBody.find("\"owner\":\"fabrizio\"");
+    assert(posCarlos != std::string::npos && posFabrizio != std::string::npos && posCarlos < posFabrizio);
 
     std::cout << "[PASS] testQueryAndPrivacyRules\n";
 }
@@ -296,7 +312,6 @@ void testUpdateAndDeleteAuthorization() {
  * @brief Punto de entrada de la suite de pruebas unitarias del microservicio de Metadata.
  */
 int main() {
-    // Inicializa telemetría hacia localhost (no bloqueante si el dashboard no está levantado en CI)
     TelemetryManager::instance().init("tecflix-metadata-unit-tests", "127.0.0.1", 4318);
 
     testVideoRegistration();

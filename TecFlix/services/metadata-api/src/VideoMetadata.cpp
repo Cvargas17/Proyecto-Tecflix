@@ -48,6 +48,8 @@ namespace tecflix::metadata {
             << "\"visibility\":\"" << escapeJsonStr(visibility) << "\","
             << "\"file\":\"" << escapeJsonStr(file) << "\","
             << "\"dash\":\"" << escapeJsonStr(dash) << "\","
+            << "\"duration\":" << duration << ","
+            << "\"sizeBytes\":" << sizeBytes << ","
             << "\"uploaded\":" << uploaded << ","
             << "\"canEdit\":" << (canEdit ? "true" : "false")
             << "}";
