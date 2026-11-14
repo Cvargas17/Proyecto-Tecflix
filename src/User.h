@@ -1,9 +1,10 @@
 #pragma once
 #include <cstddef>
-#include <iostream>
+#include <cstdint>
 
-// Constantes de negocio
-constexpr size_t MAX_QUOTA_BYTES = 1073741824; // 1 GB por defecto
+constexpr size_t MAX_QUOTA_BYTES = 1073741824; // 1 GB inmodificable
+constexpr int BTREE_ORDER = 4;                 // Grado mínimo t = 2 (máx. 3 claves por nodo)
+constexpr int BTREE_T = BTREE_ORDER / 2;
 
 struct User {
     int id;
@@ -18,20 +19,22 @@ struct User {
     }
 };
 
-// Parámetros del Árbol B en disco
-constexpr int BTREE_ORDER = 4;
+// Cabecera al inicio de index.bin para persistir el offset de la raíz actual
+struct IndexHeader {
+    int64_t root_offset;
+};
 
-// Nodo del Árbol B para guardar en binario
+// Nodo del Árbol B almacenado en disco
 struct BTreeNode {
     bool is_leaf;
     int num_keys;
-    int keys[BTREE_ORDER - 1];              // IDs de los usuarios
-    std::streampos data_offsets[BTREE_ORDER - 1]; // Puntero al archivo users.dat
-    std::streampos children[BTREE_ORDER];         // Puntero al archivo index.bin
+    int keys[BTREE_ORDER - 1];
+    int64_t data_offsets[BTREE_ORDER - 1];
+    int64_t children[BTREE_ORDER];
 
     BTreeNode() : is_leaf(true), num_keys(0) {
         for (int i = 0; i < BTREE_ORDER; ++i) {
-            children[i] = -1; // -1 indica null/vacío en disco
+            children[i] = -1;
             if (i < BTREE_ORDER - 1) {
                 keys[i] = 0;
                 data_offsets[i] = -1;
