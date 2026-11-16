@@ -1,0 +1,178 @@
+name: TecFlix CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, "feat/**", "v1.0", "v2.0" ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-test-coverage:
+    name: Build, Unit Tests & Coverage (>= 90%)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install C++ toolchain and coverage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ gcovr mingw-w64 zip
+
+      - name: Configure and build with coverage instrumentation
+        run: |
+          cmake -S TecFlix -B build-coverage -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_COVERAGE=ON \
+            -DBUILD_TESTING=ON
+          cmake --build build-coverage --parallel
+
+      - name: Run unit tests (CTest) with local OTLP mock receiver
+        run: |
+          python3 -c "
+          import http.server, socketserver, threading
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  self.rfile.read(length)
+                  self.send_response(200)
+                  self.end_headers()
+              def log_message(self, *args): pass
+          server = socketserver.TCPServer(('127.0.0.1', 4318), Handler)
+          threading.Thread(target=server.serve_forever, daemon=True).start()
+          import time; time.sleep(30)
+          " &
+          sleep 1
+          ctest --test-dir build-coverage --output-on-failure --verbose
+
+      - name: Measure and enforce >= 90% code coverage (gcovr)
+        run: |
+          mkdir -p coverage-report
+          gcovr -r TecFlix build-coverage \
+            --filter "TecFlix/common/" \
+            --filter "TecFlix/services/metadata-api/" \
+            --exclude "TecFlix/tests/" \
+            --fail-under-line 90 \
+            --print-summary \
+            --html-details coverage-report/index.html \
+            --xml coverage-report/coverage.xml
+
+      - name: Upload code coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tecflix-coverage-report
+          path: coverage-report/
+
+      - name: Build and package Release binaries (Linux & Windows)
+        run: |
+          cmake -S TecFlix -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_COVERAGE=OFF \
+            -DBUILD_TESTING=OFF
+          cmake --build build-release --parallel
+
+          mkdir -p release-artifacts/linux release-artifacts/windows
+          cp build-release/tecflix-server release-artifacts/linux/tecflix-server
+
+          x86_64-w64-mingw32-g++ -std=c++17 -O2 \
+            -ITecFlix/common/include \
+            -ITecFlix/services/metadata-api/include \
+            TecFlix/src/main.cpp \
+            TecFlix/common/src/TelemetryManager.cpp \
+            TecFlix/services/metadata-api/src/VideoMetadata.cpp \
+            TecFlix/services/metadata-api/src/MetadataService.cpp \
+            TecFlix/services/metadata-api/src/MetadataController.cpp \
+            -o release-artifacts/windows/tecflix-server.exe \
+            -lws2_32 -pthread -static-libgcc -static-libstdc++
+
+          tar -czf release-artifacts/tecflix-server-linux-x64.tar.gz -C release-artifacts/linux tecflix-server
+          (cd release-artifacts/windows && zip -r ../tecflix-server-windows-x64.zip tecflix-server.exe)
+
+      - name: Upload downloadable Release executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: tecflix-release-executables
+          path: |
+            release-artifacts/tecflix-server-linux-x64.tar.gz
+            release-artifacts/tecflix-server-windows-x64.zip
+
+  functional-tests:
+    name: Functional E2E Tests (Playwright & API Flows)
+    runs-on: ubuntu-latest
+    needs: build-test-coverage
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download compiled server binary
+        uses: actions/download-artifact@v4
+        with:
+          name: tecflix-release-executables
+          path: dist/
+
+      - name: Install Playwright (Python) for browser & HTTP functional tests
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+
+      - name: Execute functional end-to-end test suite against live server
+        run: |
+          tar -xzf dist/tecflix-server-linux-x64.tar.gz -C dist/
+          chmod +x dist/tecflix-server
+          mkdir -p runtime-e2e
+          (cd runtime-e2e && ../dist/tecflix-server 8080) &
+          SERVER_PID=$!
+          sleep 2
+
+          python3 - << 'EOF'
+          import requests
+          from playwright.sync_api import sync_playwright
+
+          BASE = "http://127.0.0.1:8080"
+
+          # 1. Healthcheck
+          r = requests.get(f"{BASE}/health")
+          assert r.status_code == 200 and r.json()["status"] == "healthy"
+
+          # 2. Registro e inicio de sesión
+          s = requests.Session()
+          reg = s.post(f"{BASE}/api/register", data={"username": "e2e_user", "password": "password123"})
+          assert reg.status_code == 200
+
+          # 3. Subida de video de prueba y verificación en catálogo paginado/ordenado
+          up = s.post(
+              f"{BASE}/api/upload?filename=demo.mp4&title=Video+E2E&visibility=public&topic=Sistemas",
+              data=b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom"
+          )
+          assert up.status_code == 201
+          vid_id = up.json()["id"]
+
+          lst = s.get(f"{BASE}/api/videos?scope=all&sortBy=author&order=asc&page=1&limit=10")
+          assert lst.status_code == 200
+          body = lst.json()
+          assert body["totalItems"] == 1
+          assert body["items"][0]["id"] == vid_id
+
+          # 4. Actualización de metadatos y verificación con navegador headless Playwright
+          upd = s.patch(f"{BASE}/api/videos/{vid_id}", json={"title": "Video E2E Actualizado", "visibility": "private"})
+          assert upd.status_code == 200
+
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              page = browser.new_page()
+              resp = page.goto(f"{BASE}/api/videos/{vid_id}")
+              # Sin sesión en el navegador, el video privado debe retornar 403 Forbidden
+              assert resp.status == 403
+              browser.close()
+
+          # 5. Eliminación limpia
+          dele = s.delete(f"{BASE}/api/videos/{vid_id}")
+          assert dele.status_code == 200
+          print("[PASS] Functional E2E tests completed successfully.")
+          EOF
+
+          kill $SERVER_PID || true

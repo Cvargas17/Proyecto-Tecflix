@@ -1,0 +1,55 @@
+services:
+  mongodb:
+    image: mongo:7
+    container_name: tecflix-mongodb
+    restart: unless-stopped
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+  aspire-dashboard:
+    image: mcr.microsoft.com/dotnet/aspire-dashboard:9.0
+    container_name: tecflix-aspire
+    restart: unless-stopped
+    ports:
+      - "18888:18888"
+      - "4318:4318"
+    environment:
+      - DOTNET_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true
+      - ASPIRE_DASHBOARD_UNSECURED_ALLOW_ANONYMOUS=true
+      - DOTNET_DASHBOARD_OTLP_HTTP_ENDPOINT_URL=http://0.0.0.0:4318
+      - DOTNET_DASHBOARD_OTLP_ENDPOINT_URL=http://0.0.0.0:4317
+
+  tecflix-server:
+    build:
+      context: ./TecFlix
+      dockerfile: Dockerfile
+    container_name: tecflix-server
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - PORT=8080
+      - MONGO_URI=mongodb://mongodb:27017
+      - MONGO_DB=tecflix
+      - MONGO_COLLECTION=videos
+      - OTLP_HOST=aspire-dashboard
+      - OTLP_PORT=4318
+    volumes:
+      - tecflix_data:/app/data
+    depends_on:
+      mongodb:
+        condition: service_healthy
+      aspire-dashboard:
+        condition: service_started
+
+volumes:
+  mongodb_data:
+  tecflix_data:

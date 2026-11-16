@@ -1,0 +1,36 @@
+# IDEs y editores
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Carpetas de compilación y artefactos de CI/CD
+build*/
+cmake-build-*/
+coverage-report/
+release-artifacts/
+dist/
+runtime-e2e/
+
+# Dependencias y reportes de Frontend / Playwright E2E
+node_modules/
+test-results/
+playwright-report/
+
+# Binarios, objetos y archivos de instrumentación (gcov/gcovr)
+*.exe
+*.o
+*.obj
+*.a
+*.so
+*.dll
+*.gcda
+*.gcno
+*.gcov
+prueba.bin
+
+# Datos locales en tiempo de ejecución y archivos multimedia
+TecFlix/data/*.db
+TecFlix/data/videos/*
+TecFlix/data/dash/*
+!TecFlix/data/.gitkeep
