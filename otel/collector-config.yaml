@@ -1,0 +1,25 @@
+# Recibe OTLP/HTTP (JSON) desde los nodos TecFlix y lo reenvia a Aspire por OTLP/gRPC (protobuf).
+# Aspire Dashboard rechaza OTLP/HTTP JSON con 415, por eso este intermediario.
+receivers:
+  otlp:
+    protocols:
+      http:
+        endpoint: 0.0.0.0:4318
+
+exporters:
+  otlp:
+    endpoint: aspire-dashboard:4317
+    tls:
+      insecure: true
+
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [otlp]
+    metrics:
+      receivers: [otlp]
+      exporters: [otlp]
+    logs:
+      receivers: [otlp]
+      exporters: [otlp]
