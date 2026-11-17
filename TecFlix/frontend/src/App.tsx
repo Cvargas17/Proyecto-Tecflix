@@ -1,31 +1,43 @@
 import { useEffect, useState } from 'react';
-import { api } from './api';
+import { api, type UserProfile } from './api';
 import AuthModal from './components/AuthModal';
 import PlayerModal from './components/PlayerModal';
 import UploadView from './components/UploadView';
 import VideoGrid from './components/VideoGrid';
 import type { View } from './types';
 
+function formatBytes(bytes?: number): string {
+  if (bytes === undefined || bytes < 0) return '0 MB';
+  if (bytes >= 1024 * 1024 * 1024) return `${(bytes / (1024 * 1024 * 1024)).toFixed(2)} GB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export default function App() {
-  const [me, setMe] = useState<string | null>(null);
+  const [user, setUser] = useState<UserProfile | null>(null);
   const [view, setView] = useState<View>('browse');
   const [showAuth, setShowAuth] = useState(false);
   const [playing, setPlaying] = useState<string | null>(null);
   const [reloadKey, setReloadKey] = useState(0);
 
   useEffect(() => {
-    api.me().then((r) => setMe(r.username)).catch(() => {});
-  }, []);
+    api.me()
+      .then((profile) => setUser(profile.username ? profile : null))
+      .catch(() => setUser(null));
+  }, [reloadKey]);
 
   const go = (v: View) => {
-    if (v !== 'browse' && !me) { setShowAuth(true); return; }
+    if (v !== 'browse' && !user?.username) {
+      setShowAuth(true);
+      return;
+    }
     setView(v);
   };
+
   const reload = () => setReloadKey((k) => k + 1);
 
   const logout = async () => {
     await api.logout();
-    setMe(null);
+    setUser(null);
     setView('browse');
     reload();
   };
@@ -43,10 +55,15 @@ export default function App() {
           {tab('mine', 'My Videos')}
           {tab('upload', 'Upload')}
         </nav>
-        <div>
-          {me ? (
+        <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
+          {user?.username ? (
             <>
-              <span className="dim">{me} </span>
+              <span className="dim">
+                {user.username}
+                {typeof user.quota_bytes === 'number' && (
+                  <> ({formatBytes(user.used_bytes)} / {formatBytes(user.quota_bytes)})</>
+                )}
+              </span>
               <button className="btn" onClick={() => void logout()}>Log out</button>
             </>
           ) : (
@@ -56,18 +73,48 @@ export default function App() {
       </header>
 
       <main>
-        {view === 'browse' && (<><h2>Public videos</h2><VideoGrid scope="public" reloadKey={reloadKey} onOpen={setPlaying} /></>)}
-        {view === 'mine' && (<><h2>My videos</h2><VideoGrid scope="mine" reloadKey={reloadKey} onOpen={setPlaying} /></>)}
-        {view === 'upload' && <UploadView onUploaded={() => { reload(); setView('mine'); }} />}
+        {view === 'browse' && (
+          <>
+            <h2>Available videos</h2>
+            <VideoGrid scope="all" reloadKey={reloadKey} onOpen={setPlaying} />
+          </>
+        )}
+        {view === 'mine' && (
+          <>
+            <h2>My videos</h2>
+            <VideoGrid scope="mine" reloadKey={reloadKey} onOpen={setPlaying} />
+          </>
+        )}
+        {view === 'upload' && (
+          <UploadView
+            user={user}
+            onUploaded={() => {
+              reload();
+              setView('mine');
+            }}
+          />
+        )}
       </main>
 
       {showAuth && (
         <AuthModal
           onClose={() => setShowAuth(false)}
-          onAuthed={(u) => { setMe(u); setShowAuth(false); reload(); }}
+          onAuthed={(username) => {
+            setUser({ username });
+            setShowAuth(false);
+            reload();
+          }}
         />
       )}
-      {playing && <PlayerModal videoId={playing} onClose={() => { setPlaying(null); reload(); }} />}
+      {playing && (
+        <PlayerModal
+          videoId={playing}
+          onClose={() => {
+            setPlaying(null);
+            reload();
+          }}
+        />
+      )}
     </>
   );
 }

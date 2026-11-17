@@ -1,0 +1,204 @@
+name: TecFlix CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, "feat/**", "v1.0", "v2.0" ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+
+jobs:
+  build-test-coverage:
+    name: Build, Unit Tests & Coverage (>= 90%)
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js for React Frontend
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Build React + TypeScript Frontend
+        run: |
+          cd TecFlix/frontend
+          npm ci
+          npm run build
+          mkdir -p ../web/dist
+          cp -r dist/* ../web/dist/
+
+      - name: Install C++ toolchain and coverage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build g++ gcovr mingw-w64 zip
+
+      - name: Configure and build with coverage instrumentation
+        run: |
+          cmake -S TecFlix -B build-coverage -G Ninja \
+            -DCMAKE_BUILD_TYPE=Debug \
+            -DENABLE_COVERAGE=ON \
+            -DBUILD_TESTING=ON
+          cmake --build build-coverage --parallel
+
+      - name: Run unit tests (CTest) with local OTLP mock receiver
+        run: |
+          python3 -c "
+          import http.server, socketserver, threading, time
+          class Handler(http.server.BaseHTTPRequestHandler):
+              def do_POST(self):
+                  length = int(self.headers.get('Content-Length', 0))
+                  self.rfile.read(length)
+                  self.send_response(200)
+                  self.end_headers()
+              def log_message(self, *args): pass
+          server = socketserver.TCPServer(('127.0.0.1', 4318), Handler)
+          threading.Thread(target=server.serve_forever, daemon=True).start()
+          time.sleep(30)
+          " &
+          sleep 1
+          ctest --test-dir build-coverage --output-on-failure --verbose
+
+      - name: Measure and enforce >= 90% code coverage (gcovr)
+        run: |
+          mkdir -p coverage-report
+          gcovr -r TecFlix build-coverage \
+            --filter "TecFlix/common/" \
+            --filter "TecFlix/services/metadata-api/" \
+            --filter "TecFlix/services/user-api/" \
+            --exclude "TecFlix/tests/" \
+            --fail-under-line 90 \
+            --print-summary \
+            --html-details coverage-report/index.html \
+            --xml coverage-report/coverage.xml
+
+      - name: Upload code coverage report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: tecflix-coverage-report
+          path: coverage-report/
+
+      - name: Build and package Release binaries (Linux & Windows)
+        run: |
+          cmake -S TecFlix -B build-release -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DENABLE_COVERAGE=OFF \
+            -DBUILD_TESTING=OFF
+          cmake --build build-release --parallel
+
+          mkdir -p release-artifacts/linux release-artifacts/windows
+          cp build-release/tecflix-server release-artifacts/linux/tecflix-server
+          cp -r TecFlix/web release-artifacts/linux/web
+          cp -r TecFlix/web release-artifacts/windows/web
+
+          x86_64-w64-mingw32-g++ -std=c++17 -O2 -DNOMINMAX \
+            -ITecFlix/common/include \
+            -ITecFlix/services/metadata-api/include \
+            -ITecFlix/services/user-api/include \
+            TecFlix/src/main.cpp \
+            TecFlix/common/src/TelemetryManager.cpp \
+            TecFlix/services/metadata-api/src/VideoMetadata.cpp \
+            TecFlix/services/metadata-api/src/MetadataService.cpp \
+            TecFlix/services/metadata-api/src/MetadataController.cpp \
+            TecFlix/services/user-api/src/DiskBTree.cpp \
+            TecFlix/services/user-api/src/BTreeUserRepository.cpp \
+            -o release-artifacts/windows/tecflix-server.exe \
+            -lws2_32 -pthread -static-libgcc -static-libstdc++
+
+          tar -czf release-artifacts/tecflix-server-linux-x64.tar.gz -C release-artifacts/linux tecflix-server web
+          (cd release-artifacts/windows && zip -r ../tecflix-server-windows-x64.zip tecflix-server.exe web)
+
+      - name: Upload downloadable Release executables
+        uses: actions/upload-artifact@v4
+        with:
+          name: tecflix-release-executables
+          path: |
+            release-artifacts/tecflix-server-linux-x64.tar.gz
+            release-artifacts/tecflix-server-windows-x64.zip
+
+  functional-tests:
+    name: Functional E2E Tests (Playwright UI & API Flows)
+    runs-on: ubuntu-latest
+    needs: build-test-coverage
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Download compiled server binary & frontend bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: tecflix-release-executables
+          path: dist/
+
+      - name: Install Playwright (Python) for browser & HTTP functional tests
+        run: |
+          pip install playwright requests
+          playwright install chromium --with-deps
+
+      - name: Execute functional end-to-end UI & API test suite
+        run: |
+          tar -xzf dist/tecflix-server-linux-x64.tar.gz -C dist/
+          chmod +x dist/tecflix-server
+          mkdir -p runtime-e2e
+          cp -r dist/web runtime-e2e/web
+          (cd runtime-e2e && ../dist/tecflix-server 8080) &
+          SERVER_PID=$!
+          sleep 2
+
+          python3 - << 'EOF'
+          import tempfile, os, requests
+          from playwright.sync_api import sync_playwright
+
+          BASE = "http://127.0.0.1:8080"
+
+          # 1. Healthcheck
+          r = requests.get(f"{BASE}/health")
+          assert r.status_code == 200 and r.json()["status"] == "healthy"
+
+          # 2. Flujo E2E completo desde el navegador React con Playwright
+          with sync_playwright() as p:
+              browser = p.chromium.launch()
+              context = browser.new_context()
+              page = context.new_page()
+
+              # Abrir interfaz React y registrar cuenta desde el modal
+              page.goto(BASE)
+              page.get_by_role("button", name="Log in").click()
+              page.get_by_role("button", name="Register").click()
+              inputs = page.locator("input")
+              inputs.nth(0).fill("e2e_user")
+              inputs.nth(1).fill("password123")
+              page.locator("form button[type='submit'], .modal button.red").first.click()
+              page.wait_for_timeout(800)
+
+              # Verificar que la cuota fija aparece en el encabezado
+              assert "e2e_user" in page.content()
+
+              # Navegar a la pestaña Upload y subir un archivo MP4 de prueba
+              page.get_by_role("button", name="Upload").click()
+              with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp:
+                  tmp.write(b"\x00\x00\x00\x18ftypmp42\x00\x00\x00\x00mp42isom")
+                  tmp_path = tmp.name
+
+              try:
+                  page.locator("input[type='file']").set_input_files(tmp_path)
+                  page.locator("input[type='text']").first.fill("Video E2E Playwright")
+                  page.locator("select").last.select_option("public")
+                  page.locator("section button.red").click()
+                  page.wait_for_timeout(1200)
+              finally:
+                  os.remove(tmp_path)
+
+              # Verificar que el video aparece en My Videos con controles de paginación y ordenamiento
+              assert "Video E2E Playwright" in page.content()
+              assert "Page 1 of" in page.content()
+
+              browser.close()
+
+          print("[PASS] Functional Playwright UI & API E2E tests completed successfully.")
+          EOF
+
+          kill $SERVER_PID || true

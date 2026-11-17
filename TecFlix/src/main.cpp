@@ -1,29 +1,48 @@
 // TecFlix - a self-contained video sharing web server.
-// C++17, no third-party dependencies (Winsock on Windows, BSD sockets elsewhere).
-//
-// Features: accounts, upload, streaming (HTTP Range), delete, public/private
-// visibility, title editing and metadata extraction (MP4/MOV box parser).
-#include <condition_variable>
-#include <queue>
-#include <array>
+// C++17, integrated with BTreeUserRepository, MetadataService/MetadataController,
+// FFmpeg DASH packager and OpenTelemetry.
+
+#include "BTreeUserRepository.hpp"
+#include "IMetadataRepository.hpp"
+#include "IUserRepository.hpp"
+#include "MetadataController.hpp"
+#include "MetadataService.hpp"
+#include "TelemetryManager.hpp"
+
+#ifdef TECFLIX_USE_MONGODB
+#include "MongoMetadataRepository.hpp"
+#include <mongocxx/instance.hpp>
+#endif
+
 #include <algorithm>
+#include <array>
 #include <atomic>
+#include <cmath>
+#include <condition_variable>
+#include <csignal>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <ctime>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <map>
+#include <memory>
 #include <mutex>
+#include <queue>
 #include <random>
 #include <sstream>
 #include <string>
 #include <thread>
-#include <vector>
 #include <unordered_map>
+#include <vector>
+
 #ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
 #include <winsock2.h>
 #include <ws2tcpip.h>
 using sock_t = SOCKET;
@@ -35,7 +54,6 @@ using sock_t = SOCKET;
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#include <semaphore>
 using sock_t = int;
 #define INVALID_SOCKET (-1)
 #define CLOSESOCK close
@@ -46,14 +64,18 @@ namespace fs = std::filesystem;
 using std::string;
 using std::vector;
 
-static const uint64_t MAX_UPLOAD = 4ULL << 30;  // 4 GiB
+static const uint64_t MAX_UPLOAD = 4ULL << 30;  // 4 GiB hard ceiling
 static const size_t MAX_FORM = 64 * 1024;
 static fs::path DATA_DIR = "data";
-static fs::path WEB_DIR = "web/dist";  // React build output (see frontend/)
-static string gFfmpeg;                  // path to ffmpeg; empty when DASH packaging is unavailable
+static fs::path WEB_DIR = "web/dist";
+static string gFfmpeg;
 
 // ---------------------------------------------------------------- utilities
 
+static string getEnvOrDefault(const char* name, const string& def) {
+    const char* v = std::getenv(name);
+    return (v && *v) ? string(v) : def;
+}
 static string lower(string s) {
     for (auto& c : s) c = (char)tolower((unsigned char)c);
     return s;
@@ -65,7 +87,7 @@ static string trim(const string& s) {
 static string urldecode(const string& s) {
     string o;
     for (size_t i = 0; i < s.size(); i++) {
-        if (s[i] == '%' && i + 2 < s.size() + 0 && isxdigit((unsigned char)s[i + 1]) &&
+        if (s[i] == '%' && i + 2 < s.size() && isxdigit((unsigned char)s[i + 1]) &&
             isxdigit((unsigned char)s[i + 2])) {
             o += (char)std::stoi(s.substr(i + 1, 2), nullptr, 16);
             i += 2;
@@ -91,6 +113,18 @@ static std::map<string, string> parseForm(const string& s) {
     }
     return m;
 }
+static vector<string> parseCsvTags(const string& raw) {
+    vector<string> out;
+    size_t i = 0;
+    while (i <= raw.size()) {
+        size_t comma = raw.find(',', i);
+        if (comma == string::npos) comma = raw.size();
+        string tag = trim(raw.substr(i, comma - i));
+        if (!tag.empty()) out.push_back(tag);
+        i = comma + 1;
+    }
+    return out;
+}
 static string jstr(const string& s) {
     string o = "\"";
     for (unsigned char c : s) {
@@ -111,6 +145,39 @@ static string jstr(const string& s) {
         }
     }
     return o + "\"";
+}
+static string extractJsonStringField(const string& body, const string& key) {
+    string needle = "\"" + key + "\"";
+    size_t kpos = body.find(needle);
+    if (kpos == string::npos) return "";
+    size_t colon = body.find(':', kpos + needle.size());
+    if (colon == string::npos) return "";
+    size_t q1 = body.find('"', colon + 1);
+    if (q1 == string::npos) return "";
+    string val;
+    for (size_t i = q1 + 1; i < body.size(); ++i) {
+        if (body[i] == '\\' && i + 1 < body.size()) {
+            val.push_back(body[++i]);
+        } else if (body[i] == '"') {
+            return val;
+        } else {
+            val.push_back(body[i]);
+        }
+    }
+    return "";
+}
+static string formBodyToJson(const string& formBody) {
+    auto f = parseForm(formBody);
+    std::ostringstream oss;
+    oss << "{";
+    bool first = true;
+    for (const auto& [k, v] : f) {
+        if (!first) oss << ",";
+        oss << jstr(k) << ":" << jstr(v);
+        first = false;
+    }
+    oss << "}";
+    return oss.str();
 }
 static string randHex(int bytes) {
     static std::random_device rd;
@@ -201,20 +268,24 @@ struct Video {
     int width = 0, height = 0, tracks = 0;
     string vcodec, acodec, brand;
     string dash = "unavailable";  // unavailable | processing | ready | failed
-};
-struct User {
-    string name, salt, hash;
+    string topic;
+    vector<string> tags;
 };
 
 static std::mutex gMutex;
 static vector<Video> gVideos;
-static vector<User> gUsers;
 static std::map<string, string> gSessions;  // token -> username
 static std::unordered_map<std::string, size_t> gVideoIndex;
 static std::mutex gQueueMutex;
 static std::condition_variable gQueueCondition;
 static std::queue<sock_t> gConnectionQueue;
-static bool gServerRunning = true;
+static std::atomic<bool> gServerRunning{true};
+static sock_t gListenSocket = INVALID_SOCKET;
+
+// Instancias globales de los repositorios y servicios
+static std::shared_ptr<tecflix::users::IUserRepository> gUserRepository;
+static std::shared_ptr<tecflix::metadata::MetadataService> gMetadataService;
+static std::shared_ptr<tecflix::metadata::MetadataController> gMetadataController;
 
 static string clean(string s) {
     for (auto& c : s)
@@ -232,10 +303,6 @@ static vector<string> splitTabs(const string& line) {
     }
     return f;
 }
-static void saveUsers() {  // caller holds gMutex
-    std::ofstream o(DATA_DIR / "users.db", std::ios::trunc);
-    for (auto& u : gUsers) o << u.name << '\t' << u.salt << '\t' << u.hash << '\n';
-}
 static void saveVideos() {  // caller holds gMutex
     std::ofstream o(DATA_DIR / "videos.db", std::ios::trunc);
     for (auto& v : gVideos)
@@ -244,13 +311,8 @@ static void saveVideos() {  // caller holds gMutex
           << v.duration << '\t' << v.width << '\t' << v.height << '\t' << v.tracks << '\t' << v.vcodec << '\t'
           << v.acodec << '\t' << v.brand << '\t' << v.dash << '\n';
 }
-static void loadDb() {
+static void loadVideosDb() {
     std::string line;
-    std::ifstream u(DATA_DIR / "users.db");
-    while (std::getline(u, line)) {
-        auto f = splitTabs(line);
-        if (f.size() >= 3) gUsers.push_back({f[0], f[1], f[2]});
-    }
     std::ifstream v(DATA_DIR / "videos.db");
     while (std::getline(v, line)) {
         auto f = splitTabs(line);
@@ -261,12 +323,166 @@ static void loadDb() {
         x.duration = std::stod(f[10]); x.width = std::stoi(f[11]); x.height = std::stoi(f[12]);
         x.tracks = std::stoi(f[13]); x.vcodec = f[14]; x.acodec = f[15]; x.brand = f[16];
         if (f.size() > 17) x.dash = f[17];
-        if (x.dash == "processing") x.dash = "failed";// server stopped mid-packaging
+        if (x.dash == "processing") x.dash = "failed";
 
         gVideos.push_back(x);
         gVideoIndex[x.id] = gVideos.size() - 1;
     }
 }
+
+// ---------------------------------------------- MetadataRepository Adapter
+
+namespace {
+
+std::string mapDashStateForMetadata(const std::string& rawDash) {
+    if (rawDash == "ready") return "ready";
+    if (rawDash == "processing") return "processing";
+    if (rawDash == "failed" || rawDash == "error") return "error";
+    return "pending";
+}
+
+tecflix::metadata::VideoMetadata toDomainMetadata(const Video& v) {
+    tecflix::metadata::VideoMetadata m;
+    m.id = v.id;
+    m.owner = v.owner;
+    m.title = v.title;
+    m.topic = v.topic;
+    m.tags = v.tags;
+    m.visibility = (v.visibility == "private") ? "private" : "public";
+    m.file = v.file;
+    m.dash = mapDashStateForMetadata(v.dash);
+    m.duration = v.duration;
+    m.sizeBytes = static_cast<int64_t>(v.size);
+    m.uploaded = v.uploaded;
+    return m;
+}
+
+class EmbeddedMetadataRepository : public tecflix::metadata::IMetadataRepository {
+public:
+    bool create(const tecflix::metadata::VideoMetadata& video) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(video.id);
+        if (it != gVideoIndex.end()) {
+            Video& existing = gVideos[it->second];
+            existing.title = video.title;
+            existing.topic = video.topic;
+            existing.tags = video.tags;
+            existing.visibility = video.visibility;
+            existing.duration = video.duration;
+            if (video.sizeBytes > 0) existing.size = static_cast<uint64_t>(video.sizeBytes);
+            saveVideos();
+            return true;
+        }
+        Video v;
+        v.id = video.id;
+        v.owner = video.owner;
+        v.title = video.title;
+        v.topic = video.topic;
+        v.tags = video.tags;
+        v.visibility = video.visibility;
+        v.file = video.file;
+        v.dash = video.dash;
+        v.duration = video.duration;
+        v.size = static_cast<uint64_t>(std::max<int64_t>(0, video.sizeBytes));
+        v.uploaded = video.uploaded;
+        gVideos.push_back(v);
+        gVideoIndex[v.id] = gVideos.size() - 1;
+        saveVideos();
+        return true;
+    }
+
+    std::optional<tecflix::metadata::VideoMetadata> findById(const std::string& videoId) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(videoId);
+        if (it == gVideoIndex.end()) return std::nullopt;
+        return toDomainMetadata(gVideos[it->second]);
+    }
+
+    tecflix::metadata::PaginatedVideos findPaginated(
+        const tecflix::metadata::VideoQueryFilter& filter) override {
+        std::vector<tecflix::metadata::VideoMetadata> filtered;
+        {
+            std::lock_guard<std::mutex> g(gMutex);
+            for (const auto& vid : gVideos) {
+                if (filter.scope == "mine") {
+                    if (vid.owner != filter.requesterUsername) continue;
+                } else {
+                    if (vid.visibility == "private" && vid.owner != filter.requesterUsername) continue;
+                }
+                if (!filter.topicFilter.empty() && vid.topic != filter.topicFilter) continue;
+                if (!filter.tagFilter.empty()) {
+                    bool hasTag = std::find(vid.tags.begin(), vid.tags.end(), filter.tagFilter) != vid.tags.end();
+                    if (!hasTag) continue;
+                }
+                filtered.push_back(toDomainMetadata(vid));
+            }
+        }
+
+        bool asc = (filter.order == "asc");
+        std::sort(filtered.begin(), filtered.end(),
+                  [&](const tecflix::metadata::VideoMetadata& a,
+                      const tecflix::metadata::VideoMetadata& b) {
+                      if (filter.sortBy == "title") {
+                          return asc ? (a.title < b.title) : (a.title > b.title);
+                      }
+                      if (filter.sortBy == "owner" || filter.sortBy == "author") {
+                          return asc ? (a.owner < b.owner) : (a.owner > b.owner);
+                      }
+                      return asc ? (a.uploaded < b.uploaded) : (a.uploaded > b.uploaded);
+                  });
+
+        int totalItems = static_cast<int>(filtered.size());
+        int totalPages = std::max(1, static_cast<int>(std::ceil(static_cast<double>(totalItems) / filter.limit)));
+        int page = std::clamp(filter.page, 1, totalPages);
+
+        size_t startIdx = static_cast<size_t>((page - 1) * filter.limit);
+        size_t endIdx = std::min(filtered.size(), startIdx + static_cast<size_t>(filter.limit));
+
+        std::vector<tecflix::metadata::VideoMetadata> pageItems;
+        if (startIdx < filtered.size()) {
+            pageItems.assign(filtered.begin() + startIdx, filtered.begin() + endIdx);
+        }
+
+        return tecflix::metadata::PaginatedVideos{pageItems, page, filter.limit, totalPages, totalItems};
+    }
+
+    bool update(const tecflix::metadata::VideoMetadata& video) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(video.id);
+        if (it == gVideoIndex.end()) return false;
+        Video& v = gVideos[it->second];
+        v.title = video.title;
+        v.topic = video.topic;
+        v.tags = video.tags;
+        v.visibility = video.visibility;
+        saveVideos();
+        return true;
+    }
+
+    bool updateDashStatus(const std::string& videoId, const std::string& dashStatus) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(videoId);
+        if (it == gVideoIndex.end()) return false;
+        gVideos[it->second].dash = (dashStatus == "error") ? "failed" : dashStatus;
+        saveVideos();
+        return true;
+    }
+
+    bool remove(const std::string& videoId) override {
+        std::lock_guard<std::mutex> g(gMutex);
+        auto it = gVideoIndex.find(videoId);
+        if (it == gVideoIndex.end()) return false;
+        gVideos.erase(gVideos.begin() + static_cast<std::ptrdiff_t>(it->second));
+        gVideoIndex.clear();
+        for (size_t i = 0; i < gVideos.size(); ++i) {
+            gVideoIndex[gVideos[i].id] = i;
+        }
+        saveVideos();
+        return true;
+    }
+};
+
+}  // namespace
 
 // ------------------------------------------------------------ MP4 metadata
 
@@ -362,7 +578,7 @@ static void probe(Video& v, const fs::path& path) {
         Mp4Probe p(path.string(), v);
         if (p.f) p.walk(0, v.size, 0);
     }
-    if (!v.created) {  // fall back to file modification time
+    if (!v.created) {
         auto t = fs::last_write_time(path, ec);
         if (!ec) {
             auto s = std::chrono::time_point_cast<std::chrono::seconds>(
@@ -467,6 +683,9 @@ static bool readBody(sock_t s, Req& r) {
 // ---------------------------------------------------------------- sessions
 
 static string sessionUser(const Req& r) {
+    if (auto hdr = r.h.find("x-user"); hdr != r.h.end() && !hdr->second.empty()) {
+        return hdr->second;
+    }
     auto it = r.h.find("cookie");
     if (it == r.h.end()) return "";
     size_t p = it->second.find("tf_session=");
@@ -478,7 +697,28 @@ static string sessionUser(const Req& r) {
     return s == gSessions.end() ? "" : s->second;
 }
 
+static void revokeUserSessions(const string& username) {
+    std::lock_guard<std::mutex> g(gMutex);
+    for (auto it = gSessions.begin(); it != gSessions.end();) {
+        if (lower(it->second) == lower(username)) {
+            it = gSessions.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
 // ------------------------------------------------------------------- routes
+
+static string userProfileJson(const tecflix::users::UserRecord& u) {
+    uint64_t remaining = (u.used_bytes >= u.quota_bytes) ? 0 : (u.quota_bytes - u.used_bytes);
+    std::ostringstream o;
+    o << "{\"username\":" << jstr(u.username)
+      << ",\"quota_bytes\":" << u.quota_bytes
+      << ",\"used_bytes\":" << u.used_bytes
+      << ",\"remaining_bytes\":" << remaining << "}";
+    return o.str();
+}
 
 static string videoJson(const Video& v, const string& me) {
     std::ostringstream o;
@@ -496,29 +736,117 @@ static bool canSee(const Video& v, const string& me) { return v.visibility == "p
 
 static void handleAuth(sock_t s, Req& r, bool reg) {
     if (!readBody(s, r)) return fail(s, 400, "Bad request body");
-    auto f = parseForm(r.body);
-    string name = f["username"], pw = f["password"];
-    std::lock_guard<std::mutex> g(gMutex);
+    string name, pw;
+    if (!r.body.empty() && r.body.front() == '{') {
+        name = extractJsonStringField(r.body, "username");
+        pw = extractJsonStringField(r.body, "password");
+    } else {
+        auto f = parseForm(r.body);
+        name = f["username"];
+        pw = f["password"];
+    }
+    name = trim(name);
+
+    if (!gUserRepository) return fail(s, 500, "User repository unavailable");
+
+    tecflix::users::UserRecord profile;
     if (reg) {
         bool ok = name.size() >= 3 && name.size() <= 20 &&
                   std::all_of(name.begin(), name.end(), [](unsigned char c) { return isalnum(c) || c == '_'; });
         if (!ok) return fail(s, 400, "Username must be 3-20 letters, digits or underscore");
         if (pw.size() < 6) return fail(s, 400, "Password must have at least 6 characters");
-        for (auto& u : gUsers)
-            if (lower(u.name) == lower(name)) return fail(s, 409, "Username already taken");
-        User u{name, randHex(16), ""};
-        u.hash = hashPassword(u.salt, pw);
-        gUsers.push_back(u);
-        saveUsers();
+
+        const uint64_t defaultQuota = static_cast<uint64_t>(
+            std::stoull(getEnvOrDefault("DEFAULT_QUOTA_BYTES",
+                                        std::to_string(tecflix::users::DEFAULT_MAX_QUOTA_BYTES))));
+
+        tecflix::users::UserRecord rec;
+        std::strncpy(rec.username, name.c_str(), sizeof(rec.username) - 1);
+        string salt = randHex(16);
+        string hash = hashPassword(salt, pw);
+        std::strncpy(rec.salt, salt.c_str(), sizeof(rec.salt) - 1);
+        std::strncpy(rec.password_hash, hash.c_str(), sizeof(rec.password_hash) - 1);
+        rec.quota_bytes = defaultQuota;
+        rec.used_bytes = 0;
+        rec.created_at = static_cast<int64_t>(time(nullptr));
+
+        if (!gUserRepository->createUser(rec)) {
+            return fail(s, 409, "Username already taken");
+        }
+        profile = rec;
     } else {
-        auto it = std::find_if(gUsers.begin(), gUsers.end(), [&](const User& u) { return u.name == name; });
-        if (it == gUsers.end() || hashPassword(it->salt, pw) != it->hash)
+        auto found = gUserRepository->findByUsername(name);
+        if (!found || hashPassword(found->salt, pw) != string(found->password_hash)) {
             return fail(s, 401, "Invalid username or password");
+        }
+        profile = *found;
+        name = profile.username;
     }
+
     string tok = randHex(24);
-    gSessions[tok] = name;
-    json(s, 200, "{\"username\":" + jstr(name) + "}",
+    {
+        std::lock_guard<std::mutex> g(gMutex);
+        gSessions[tok] = name;
+    }
+    json(s, reg ? 201 : 200, userProfileJson(profile),
          "Set-Cookie: tf_session=" + tok + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800\r\n");
+}
+
+static void handleUsersEndpoint(sock_t s, Req& r, const string& me) {
+    const string targetUser = urldecode(r.path.substr(11));  // after "/api/users/"
+    if (targetUser.empty() || targetUser.find('/') != string::npos) {
+        return fail(s, 400, "Invalid username path");
+    }
+    if (me.empty()) {
+        return fail(s, 401, "Authentication required");
+    }
+    if (lower(me) != lower(targetUser)) {
+        return fail(s, 403, "Forbidden: cannot access another user's profile");
+    }
+    if (!gUserRepository) {
+        return fail(s, 500, "User repository unavailable");
+    }
+
+    if (r.method == "GET") {
+        auto found = gUserRepository->findByUsername(targetUser);
+        if (!found) return fail(s, 404, "User not found");
+        return json(s, 200, userProfileJson(*found));
+    }
+
+    if (r.method == "PUT") {
+        if (!readBody(s, r)) return fail(s, 400, "Bad request body");
+        string newPw;
+        if (!r.body.empty() && r.body.front() == '{') {
+            newPw = extractJsonStringField(r.body, "password");
+            if (newPw.empty()) newPw = extractJsonStringField(r.body, "newPassword");
+        } else {
+            auto f = parseForm(r.body);
+            newPw = !f["password"].empty() ? f["password"] : f["newPassword"];
+        }
+        if (newPw.size() < 6) {
+            return fail(s, 400, "Password must have at least 6 characters");
+        }
+        string newSalt = randHex(16);
+        string newHash = hashPassword(newSalt, newPw);
+        // quota_bytes es estrictamente inmutable: se ignora cualquier intento de cambiarlo
+        if (!gUserRepository->updateCredentials(targetUser, newSalt, newHash)) {
+            return fail(s, 404, "User not found");
+        }
+        auto updated = gUserRepository->findByUsername(targetUser);
+        if (!updated) return fail(s, 404, "User not found");
+        return json(s, 200, userProfileJson(*updated));
+    }
+
+    if (r.method == "DELETE") {
+        if (!gUserRepository->deleteUser(targetUser)) {
+            return fail(s, 404, "User not found");
+        }
+        revokeUserSessions(targetUser);
+        return json(s, 200, "{\"deleted\":true,\"username\":" + jstr(targetUser) + "}",
+                    "Set-Cookie: tf_session=; Path=/; Max-Age=0\r\n");
+    }
+
+    return fail(s, 405, "Method not allowed");
 }
 
 // ---- DASH packaging (ffmpeg): data/dash/<id>/manifest.mpd + fMP4 segments ----
@@ -528,24 +856,21 @@ static std::condition_variable gDashCondition;
 static int gDashActive = 0;
 static const int MAX_DASH_JOBS = 2;
 
-static void packageDash(Video v) {  // runs on a worker thread
+static void packageDash(Video v) {
+    tecflix::observability::ScopedSpan span("ffmpeg.packageDash", "", {{"video.id", v.id}});
     {
         std::unique_lock<std::mutex> lock(gDashMutex);
-
         gDashCondition.wait(lock, [] {
             return gDashActive < MAX_DASH_JOBS;
         });
-
         ++gDashActive;
     }
     std::error_code ec;
     fs::path in = fs::absolute(DATA_DIR / "videos" / v.file, ec);
     fs::path out = fs::absolute(DATA_DIR / "dash" / v.id, ec);
     fs::create_directories(out, ec);
-    // Re-use H.264 / AAC streams as they are; otherwise transcode to browser-friendly codecs.
     string vc = v.vcodec == "avc1" ? "copy" : "libx264 -preset veryfast -crf 23 -pix_fmt yuv420p -g 96 -sc_threshold 0";
     string ac = v.acodec == "mp4a" ? "copy" : "aac -b:a 128k";
-    // ffmpeg writes segment files relative to its working directory, so run it inside the output folder.
 #ifdef _WIN32
     string cd = "cd /d \"" + out.string() + "\" && ";
 #else
@@ -555,30 +880,29 @@ static void packageDash(Video v) {  // runs on a worker thread
                  "\" -map 0:v:0 -map 0:a:0? -c:v " + vc + " -c:a " + ac +
                  " -f dash -seg_duration 4 -use_template 1 -use_timeline 1 manifest.mpd";
 #ifdef _WIN32
-    cmd = "\"" + cmd + "\"";  // cmd.exe strips one outer pair of quotes
+    cmd = "\"" + cmd + "\"";
 #endif
     bool ok = std::system(cmd.c_str()) == 0 && fs::exists(out / "manifest.mpd", ec);
     bool found = false;
     {
         std::lock_guard<std::mutex> g(gMutex);
-
         auto indexIt = gVideoIndex.find(v.id);
-
         if (indexIt != gVideoIndex.end()) {
             Video& x = gVideos[indexIt->second];
             x.dash = ok ? "ready" : "failed";
             found = true;
         }
-
-        if (found)
-            saveVideos();
+        if (found) saveVideos();
     }
-    if (!ok || !found) fs::remove_all(out, ec);  // failed, or the video was deleted meanwhile
+    if (found && gMetadataService) {
+        gMetadataService->updateDashState(v.id, ok ? "ready" : "error");
+    }
+    if (!ok || !found) fs::remove_all(out, ec);
+    span.setStatusCode(ok ? 200 : 500);
     {
         std::lock_guard<std::mutex> lock(gDashMutex);
         --gDashActive;
     }
-
     gDashCondition.notify_one();
 }
 
@@ -586,40 +910,73 @@ static void handleUpload(sock_t s, Req& r, const string& me) {
     if (me.empty()) return fail(s, 401, "Log in to upload");
     if (!r.clen) return fail(s, 411, "Content-Length required");
     if (r.clen > MAX_UPLOAD) return fail(s, 413, "File too large (max 4 GiB)");
+
     string orig = fs::path(r.q["filename"]).filename().string();
     string ext = lower(fs::path(orig).extension().string());
     string mime = mimeFor(ext);
     if (mime.empty()) return fail(s, 400, "Unsupported type. Use mp4, m4v, mov, webm, ogv or mkv");
+
+    // Invariante de cuota: validar y reservar antes de escribir un solo byte en disco
+    if (!gUserRepository) return fail(s, 500, "User repository unavailable");
+    auto userOpt = gUserRepository->findByUsername(me);
+    if (!userOpt) return fail(s, 401, "User session invalid");
+    if (!gUserRepository->reserveQuota(me, r.clen)) {
+        return fail(s, 413, "Storage quota exceeded");
+    }
+
     string title = trim(clean(r.q["title"]));
     if (title.empty()) title = fs::path(orig).stem().string();
     if (title.size() > 120) title.resize(120);
     string id = randHex(6), file = id + ext;
     fs::path path = DATA_DIR / "videos" / file;
+
     {
         std::ofstream out(path, std::ios::binary);
-        if (!out) return fail(s, 500, "Cannot store file");
+        if (!out) {
+            gUserRepository->releaseQuota(me, r.clen);
+            return fail(s, 500, "Cannot store file");
+        }
         uint64_t got = std::min<uint64_t>(r.pre.size(), r.clen);
         out.write(r.pre.data(), (std::streamsize)got);
         vector<char> buf(256 * 1024);
         while (got < r.clen) {
             int n = recv(s, buf.data(), (int)std::min<uint64_t>(buf.size(), r.clen - got), 0);
-            if (n <= 0) { out.close(); std::error_code ec; fs::remove(path, ec); return; }
+            if (n <= 0) {
+                out.close();
+                std::error_code ec;
+                fs::remove(path, ec);
+                gUserRepository->releaseQuota(me, r.clen);
+                return;
+            }
             out.write(buf.data(), n);
             got += (uint64_t)n;
         }
     }
+
     Video v;
-    v.id = id; v.owner = me; v.title = title; v.file = file; v.orig = clean(orig); v.mime = mime;
+    v.id = id;
+    v.owner = me;
+    v.title = title;
+    v.file = file;
+    v.orig = clean(orig);
+    v.mime = mime;
     v.visibility = r.q["visibility"] == "public" ? "public" : "private";
     v.uploaded = (int64_t)time(nullptr);
+    v.topic = trim(clean(r.q["topic"]));
+    v.tags = parseCsvTags(r.q["tags"]);
     probe(v, path);
     if (!gFfmpeg.empty()) v.dash = "processing";
-    std::lock_guard<std::mutex> g(gMutex);
 
-    gVideos.push_back(v);
-    gVideoIndex[v.id] = gVideos.size() - 1;
+    {
+        std::lock_guard<std::mutex> g(gMutex);
+        gVideos.push_back(v);
+        gVideoIndex[v.id] = gVideos.size() - 1;
+        saveVideos();
+    }
 
-    saveVideos();
+    if (gMetadataService) {
+        gMetadataService->registerVideo(toDomainMetadata(v));
+    }
 
     if (!gFfmpeg.empty())
         std::thread(packageDash, v).detach();
@@ -677,7 +1034,7 @@ static void serveStatic(sock_t s, string p) {
         {".json", "application/json"}, {".map", "application/json"}, {".png", "image/png"},
         {".jpg", "image/jpeg"}, {".woff2", "font/woff2"}, {".woff", "font/woff"}, {".txt", "text/plain"}};
     std::error_code ec;
-    if (!fs::is_regular_file(path, ec) && path.extension().empty())  // single-page-app fallback
+    if (!fs::is_regular_file(path, ec) && path.extension().empty())
         path = WEB_DIR / "index.html";
     auto t = types.find(lower(path.extension().string()));
     std::ifstream f(path, std::ios::binary);
@@ -692,6 +1049,64 @@ static void route(sock_t s, Req& r) {
     const string& p = r.path;
     const string& m = r.method;
 
+    // Delegar endpoints de Metadata API al controlador dedicado
+    if (gMetadataController && (p == "/api/videos" || p.rfind("/api/videos/", 0) == 0)) {
+        if (r.clen > 0 && !readBody(s, r)) {
+            return fail(s, 400, "Bad request body");
+        }
+
+        tecflix::metadata::HttpRequest metaReq;
+        metaReq.method = m;
+        metaReq.path = p;
+        metaReq.queryParams = r.q;
+        metaReq.headers = r.h;
+        if (!me.empty()) {
+            metaReq.headers["x-user"] = me;
+        }
+
+        if (p.rfind("/api/videos/", 0) == 0 && m == "POST") {
+            metaReq.method = "PATCH";
+            metaReq.body = (!r.body.empty() && r.body.front() != '{') ? formBodyToJson(r.body) : r.body;
+        } else {
+            metaReq.body = r.body;
+        }
+
+        string deletedFile;
+        string deletedId;
+        string deletedOwner;
+        uint64_t deletedSize = 0;
+        if (m == "DELETE" && p.rfind("/api/videos/", 0) == 0) {
+            deletedId = p.substr(12);
+            std::lock_guard<std::mutex> g(gMutex);
+            auto idxIt = gVideoIndex.find(deletedId);
+            if (idxIt != gVideoIndex.end()) {
+                deletedFile = gVideos[idxIt->second].file;
+                deletedOwner = gVideos[idxIt->second].owner;
+                deletedSize = gVideos[idxIt->second].size;
+            }
+        }
+
+        auto res = gMetadataController->handleRequest(metaReq);
+
+        if (m == "DELETE" && res.statusCode == 200 && !deletedId.empty()) {
+            std::error_code ec;
+            if (!deletedFile.empty()) fs::remove(DATA_DIR / "videos" / deletedFile, ec);
+            fs::remove_all(DATA_DIR / "dash" / deletedId, ec);
+            if (gUserRepository && !deletedOwner.empty() && deletedSize > 0) {
+                gUserRepository->releaseQuota(deletedOwner, deletedSize);
+            }
+        }
+
+        return json(s, res.statusCode, res.jsonBody);
+    }
+
+    string traceId = r.h.count("x-trace-id") ? r.h["x-trace-id"] : "";
+    tecflix::observability::ScopedSpan span(m + " " + p, traceId, {{"http.method", m}, {"http.route", p}});
+
+    if (p == "/health" && m == "GET") {
+        span.setStatusCode(200);
+        return json(s, 200, "{\"status\":\"healthy\",\"service\":\"tecflix-server\"}");
+    }
     if (p == "/api/register" && m == "POST") return handleAuth(s, r, true);
     if (p == "/api/login" && m == "POST") return handleAuth(s, r, false);
     if (p == "/api/logout" && m == "POST") {
@@ -706,39 +1121,17 @@ static void route(sock_t s, Req& r) {
         }
         return json(s, 200, "{}", "Set-Cookie: tf_session=; Path=/; Max-Age=0\r\n");
     }
-    if (p == "/api/me" && m == "GET")
-        return json(s, 200, me.empty() ? "{\"username\":null}" : "{\"username\":" + jstr(me) + "}");
-    if (p == "/api/upload" && m == "POST") return handleUpload(s, r, me);
-
-    if (p == "/api/videos" && m == "GET") {
-        bool mine = r.q["scope"] == "mine";
-
-        if (mine && me.empty())
-            return fail(s, 401, "Log in first");
-
-        vector<Video> videosCopy;
-
-        {
-            std::lock_guard<std::mutex> g(gMutex);
-
-            for (auto it = gVideos.rbegin(); it != gVideos.rend(); ++it) {
-                if (mine ? it->owner != me : it->visibility != "public")
-                    continue;
-
-                videosCopy.push_back(*it);
-            }
-        }
-
-        string out = "[";
-        bool first = true;
-
-        for (const auto& video : videosCopy) {
-            out += (first ? "" : ",") + videoJson(video, me);
-            first = false;
-        }
-
-        return json(s, 200, out + "]");
+    if (p == "/api/me" && m == "GET") {
+        if (me.empty()) return fail(s, 401, "Not authenticated");
+        if (!gUserRepository) return json(s, 200, "{\"username\":" + jstr(me) + "}");
+        auto found = gUserRepository->findByUsername(me);
+        if (!found) return fail(s, 404, "User not found");
+        return json(s, 200, userProfileJson(*found));
     }
+    if (p.rfind("/api/users/", 0) == 0) {
+        return handleUsersEndpoint(s, r, me);
+    }
+    if (p == "/api/upload" && m == "POST") return handleUpload(s, r, me);
 
     // /dash/<id>/<file>: manifest and segments of a packaged video
     if (p.rfind("/dash/", 0) == 0 && (m == "GET" || m == "HEAD")) {
@@ -748,93 +1141,40 @@ static void route(sock_t s, Req& r) {
         bool okName = !name.empty() && name.find("..") == string::npos &&
                       std::all_of(name.begin(), name.end(),
                                   [](unsigned char c) { return isalnum(c) || c == '.' || c == '_' || c == '-'; });
-        if (!isHexId(did) || !okName) return fail(s, 404, "Not found");
+        if (!isHexId(did) || !okName) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
         {
             std::lock_guard<std::mutex> g(gMutex);
-
             auto indexIt = gVideoIndex.find(did);
-
-            if (indexIt == gVideoIndex.end())
-                return fail(s, 404, "Not found");
-
+            if (indexIt == gVideoIndex.end()) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
             Video& video = gVideos[indexIt->second];
-
-            if (!canSee(video, me) || video.dash != "ready")
-                return fail(s, 404, "Not found");
+            if (!canSee(video, me) || video.dash != "ready") { span.setStatusCode(404); return fail(s, 404, "Not found"); }
         }
         string ext = lower(fs::path(name).extension().string());
         return streamFile(s, r, DATA_DIR / "dash" / did / name, ext == ".mpd" ? "application/dash+xml" : "video/mp4");
     }
 
-    // /api/videos/<id>  and  /video/<id>
-    string id;
-    bool isApi = p.rfind("/api/videos/", 0) == 0, isStream = p.rfind("/video/", 0) == 0;
-    if (isApi) id = p.substr(12);
-    else if (isStream) id = p.substr(7);
-    if (isApi || isStream) {
-        if (!isHexId(id)) return fail(s, 404, "Not found");
-
+    // /video/<id>: streaming directo por rangos HTTP
+    if (p.rfind("/video/", 0) == 0) {
+        string id = p.substr(7);
+        if (!isHexId(id)) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
         Video copy;
         {
             std::lock_guard<std::mutex> g(gMutex);
-
             auto indexIt = gVideoIndex.find(id);
-
-            if (indexIt == gVideoIndex.end())
-                return fail(s, 404, "Video not found");
-
+            if (indexIt == gVideoIndex.end()) { span.setStatusCode(404); return fail(s, 404, "Video not found"); }
             Video& video = gVideos[indexIt->second];
-
-            if (!canSee(video, me))
-                return fail(s, 404, "Video not found");
-
+            if (!canSee(video, me)) { span.setStatusCode(404); return fail(s, 404, "Video not found"); }
             copy = video;
         }
-        if (isStream) return (m == "GET" || m == "HEAD") ? streamFile(s, r, DATA_DIR / "videos" / copy.file, copy.mime) : fail(s, 405, "Method not allowed");
-        if (m == "GET") return json(s, 200, videoJson(copy, me));
-        if (copy.owner != me) return fail(s, 403, "Only the owner can do that");
-            if (m == "DELETE") {
-                std::lock_guard<std::mutex> g(gMutex);
-                gVideos.erase(std::remove_if(gVideos.begin(), gVideos.end(), [&](const Video& v) { return v.id == id; }),
-                              gVideos.end());
-                gVideoIndex.clear();
-
-                for (size_t i = 0; i < gVideos.size(); ++i) {
-                    gVideoIndex[gVideos[i].id] = i;
-                }
-            saveVideos();
-            std::error_code ec;
-            fs::remove(DATA_DIR / "videos" / copy.file, ec);
-            fs::remove_all(DATA_DIR / "dash" / id, ec);
-            return json(s, 200, "{}");
+        if (m == "GET" || m == "HEAD") {
+            return streamFile(s, r, DATA_DIR / "videos" / copy.file, copy.mime);
         }
-        if (m == "POST") {  // update title and/or visibility
-            if (!readBody(s, r)) return fail(s, 400, "Bad request body");
-            auto f = parseForm(r.body);
-            std::lock_guard<std::mutex> g(gMutex);
-            auto indexIt = gVideoIndex.find(id);
-
-            if (indexIt == gVideoIndex.end())
-                return fail(s, 404, "Video not found");
-
-            Video& v = gVideos[indexIt->second];
-                if (f.count("visibility")) {
-                    if (f["visibility"] != "public" && f["visibility"] != "private")
-                        return fail(s, 400, "visibility must be public or private");
-                    v.visibility = f["visibility"];
-                }
-                if (f.count("title")) {
-                    string t = trim(clean(f["title"]));
-                    if (t.empty() || t.size() > 120) return fail(s, 400, "Title must be 1-120 characters");
-                    v.title = t;
-                }
-                saveVideos();
-                return json(s, 200, videoJson(v, me));
-        }
-
+        span.setStatusCode(405);
         return fail(s, 405, "Method not allowed");
     }
+
     if (m == "GET") return serveStatic(s, p);
+    span.setStatusCode(404);
     fail(s, 404, "Not found");
 }
 
@@ -859,36 +1199,72 @@ static void handleConn(sock_t s) {
 static void workerThread() {
     while (true) {
         sock_t s;
-
         {
             std::unique_lock<std::mutex> lock(gQueueMutex);
-
             gQueueCondition.wait(lock, [] {
-                return !gConnectionQueue.empty() || !gServerRunning;
+                return !gConnectionQueue.empty() || !gServerRunning.load();
             });
-
-            if (!gServerRunning && gConnectionQueue.empty()) {
+            if (!gServerRunning.load() && gConnectionQueue.empty()) {
                 return;
             }
-
             s = gConnectionQueue.front();
             gConnectionQueue.pop();
         }
-
         handleConn(s);
     }
 }
+static void onShutdownSignal(int /*sig*/) {
+    gServerRunning.store(false);
+    if (gListenSocket != INVALID_SOCKET) {
+        CLOSESOCK(gListenSocket);
+        gListenSocket = INVALID_SOCKET;
+    }
+    gQueueCondition.notify_all();
+}
+
 int main(int argc, char** argv) {
-    if (argc > 1 && string(argv[1]) == "--selftest") {  // SHA-256 known-answer test
+    if (argc > 1 && string(argv[1]) == "--selftest") {
         string h = toHex(sha256("abc"));
         std::cout << h << "\n"
                   << (h == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad" ? "OK" : "FAIL") << "\n";
         return 0;
     }
-    int port = argc > 1 ? std::atoi(argv[1]) : 8080;
+    int port = argc > 1 ? std::atoi(argv[1]) : std::stoi(getEnvOrDefault("PORT", "8080"));
+    const string otlpHost = getEnvOrDefault("OTLP_HOST", "127.0.0.1");
+    const int otlpPort = std::stoi(getEnvOrDefault("OTLP_PORT", "4318"));
+
+    std::signal(SIGINT, onShutdownSignal);
+    std::signal(SIGTERM, onShutdownSignal);
+
+    tecflix::observability::TelemetryManager::instance().init("tecflix-server", otlpHost, otlpPort);
+
     fs::create_directories(DATA_DIR / "videos");
-    loadDb();
-    {   // DASH packaging needs ffmpeg: TECFLIX_FFMPEG, or "ffmpeg" from PATH
+    loadVideosDb();
+
+    // Inicializar repositorio de Usuarios con Árbol B en disco
+    gUserRepository = std::make_shared<tecflix::users::BTreeUserRepository>(
+        (DATA_DIR / "users.idx").string(),
+        (DATA_DIR / "users.db").string());
+
+    // Inicializar capa de Metadata API (MongoDB en despliegue o repositorio embebido en local)
+#ifdef TECFLIX_USE_MONGODB
+    mongocxx::instance mongoInstance{};
+    const string mongoUri = getEnvOrDefault("MONGO_URI", "mongodb://localhost:27017");
+    const string mongoDb = getEnvOrDefault("MONGO_DB", "tecflix");
+    const string mongoColl = getEnvOrDefault("MONGO_COLLECTION", "videos");
+    auto metaRepo = std::make_shared<tecflix::metadata::MongoMetadataRepository>(mongoUri, mongoDb, mongoColl);
+    for (const auto& v : gVideos) {
+        if (!metaRepo->findById(v.id)) {
+            metaRepo->create(toDomainMetadata(v));
+        }
+    }
+#else
+    auto metaRepo = std::make_shared<EmbeddedMetadataRepository>();
+#endif
+    gMetadataService = std::make_shared<tecflix::metadata::MetadataService>(metaRepo);
+    gMetadataController = std::make_shared<tecflix::metadata::MetadataController>(gMetadataService);
+
+    {
         const char* env = std::getenv("TECFLIX_FFMPEG");
         string cand = env && *env ? env : "ffmpeg";
 #ifdef _WIN32
@@ -901,7 +1277,7 @@ int main(int argc, char** argv) {
                                       : "ffmpeg found: uploads are packaged for MPEG-DASH\n");
         if (!gFfmpeg.empty()) {
             std::lock_guard<std::mutex> g(gMutex);
-            for (auto& v : gVideos)  // package videos uploaded before DASH support existed
+            for (auto& v : gVideos)
                 if (v.dash == "unavailable") { v.dash = "processing"; std::thread(packageDash, v).detach(); }
             saveVideos();
         }
@@ -911,6 +1287,7 @@ int main(int argc, char** argv) {
     WSAStartup(MAKEWORD(2, 2), &wsa);
 #endif
     sock_t ls = socket(AF_INET, SOCK_STREAM, 0);
+    gListenSocket = ls;
     int yes = 1;
     setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, (const char*)&yes, sizeof yes);
     sockaddr_in a{};
@@ -919,29 +1296,40 @@ int main(int argc, char** argv) {
     a.sin_port = htons((unsigned short)port);
     if (bind(ls, (sockaddr*)&a, sizeof a) != 0 || listen(ls, 64) != 0) {
         std::cerr << "Cannot listen on port " << port << "\n";
+        tecflix::observability::TelemetryManager::instance().shutdown();
         return 1;
     }
     std::cout << "TecFlix running at http://localhost:" << port << "  (Ctrl+C to stop)\n";
 
-    const unsigned int numWorkers =
-        std::max(2u, std::thread::hardware_concurrency());
-
+    const unsigned int numWorkers = std::max(2u, std::thread::hardware_concurrency());
     std::vector<std::thread> workers;
     workers.reserve(numWorkers);
-
     for (unsigned int i = 0; i < numWorkers; ++i) {
         workers.emplace_back(workerThread);
     }
 
-    while (true) {
+    while (gServerRunning.load()) {
         sock_t c = accept(ls, nullptr, nullptr);
-        if (c == INVALID_SOCKET) continue;
-
+        if (c == INVALID_SOCKET) {
+            if (!gServerRunning.load()) break;
+            continue;
+        }
         {
             std::lock_guard<std::mutex> lock(gQueueMutex);
             gConnectionQueue.push(c);
         }
-
         gQueueCondition.notify_one();
     }
+
+    gServerRunning.store(false);
+    gQueueCondition.notify_all();
+    for (auto& w : workers) {
+        if (w.joinable()) w.join();
+    }
+
+    tecflix::observability::TelemetryManager::instance().shutdown();
+#ifdef _WIN32
+    WSACleanup();
+#endif
+    return 0;
 }
