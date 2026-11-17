@@ -19,9 +19,13 @@ using otel_sock_t = SOCKET;
 #define OTEL_INVALID_SOCK INVALID_SOCKET
 #else
 #include <arpa/inet.h>
+#include <cerrno>
+#include <fcntl.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/time.h>
 #include <unistd.h>
 using otel_sock_t = int;
 #define OTEL_CLOSE_SOCK close
@@ -64,6 +68,61 @@ double computePercentile(std::vector<double> sorted, double q) {
     return sorted[idx];
 }
 
+bool connectWithTimeout(otel_sock_t sock, const sockaddr* addr, int addrLen, int timeoutMs) {
+#ifdef _WIN32
+    u_long nonBlocking = 1;
+    ioctlsocket(sock, FIONBIO, &nonBlocking);
+    int rc = connect(sock, addr, addrLen);
+    if (rc != 0) {
+        if (WSAGetLastError() != WSAEWOULDBLOCK) {
+            return false;
+        }
+        fd_set writeFds;
+        FD_ZERO(&writeFds);
+        FD_SET(sock, &writeFds);
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        if (select(0, nullptr, &writeFds, nullptr, &tv) <= 0) {
+            return false;
+        }
+        int soError = 0;
+        int optLen = sizeof(soError);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, reinterpret_cast<char*>(&soError), &optLen) != 0 || soError != 0) {
+            return false;
+        }
+    }
+    u_long blocking = 0;
+    ioctlsocket(sock, FIONBIO, &blocking);
+    return true;
+#else
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags | O_NONBLOCK);
+    int rc = connect(sock, addr, static_cast<socklen_t>(addrLen));
+    if (rc != 0) {
+        if (errno != EINPROGRESS) {
+            return false;
+        }
+        fd_set writeFds;
+        FD_ZERO(&writeFds);
+        FD_SET(sock, &writeFds);
+        timeval tv{};
+        tv.tv_sec = timeoutMs / 1000;
+        tv.tv_usec = (timeoutMs % 1000) * 1000;
+        if (select(sock + 1, nullptr, &writeFds, nullptr, &tv) <= 0) {
+            return false;
+        }
+        int soError = 0;
+        socklen_t optLen = sizeof(soError);
+        if (getsockopt(sock, SOL_SOCKET, SO_ERROR, &soError, &optLen) != 0 || soError != 0) {
+            return false;
+        }
+    }
+    fcntl(sock, F_SETFL, flags);
+    return true;
+#endif
+}
+
 } // namespace
 
 TelemetryManager& TelemetryManager::instance() {
@@ -97,6 +156,10 @@ void TelemetryManager::shutdown() {
     if (workerThread_.joinable()) {
         workerThread_.join();
     }
+    std::lock_guard<std::mutex> lock(queueMutex_);
+    while (!taskQueue_.empty()) {
+        taskQueue_.pop();
+    }
 }
 
 uint64_t TelemetryManager::nowNanos() {
@@ -119,7 +182,6 @@ std::string TelemetryManager::generateHexId(size_t numBytes) {
 }
 
 TraceContext TelemetryManager::parseTraceparent(const std::string& headerValue) {
-    // Formato W3C: 00-<32hex traceId>-<16hex parentSpanId>-<2hex flags>
     if (headerValue.size() < 55) return {};
     if (headerValue[2] != '-' || headerValue[35] != '-' || headerValue[52] != '-') return {};
 
@@ -311,18 +373,24 @@ LatencySummary TelemetryManager::recordHttpObservation(const std::string& operat
 }
 
 void TelemetryManager::workerLoop() {
-    while (true) {
+    while (running_.load()) {
         OtlpTask task;
         {
             std::unique_lock<std::mutex> lock(queueMutex_);
             queueCv_.wait(lock, [this] { return !taskQueue_.empty() || !running_.load(); });
-            if (!running_.load() && taskQueue_.empty()) {
+            if (!running_.load()) {
                 break;
             }
             task = std::move(taskQueue_.front());
             taskQueue_.pop();
         }
-        sendHttpPost(task.endpoint, task.payload);
+        if (!sendHttpPost(task.endpoint, task.payload)) {
+            // Si el colector OTLP no está disponible, descartar la cola acumulada para no bloquear
+            std::lock_guard<std::mutex> lock(queueMutex_);
+            while (!taskQueue_.empty()) {
+                taskQueue_.pop();
+            }
+        }
     }
 }
 
@@ -342,7 +410,7 @@ bool TelemetryManager::sendHttpPost(const std::string& endpoint, const std::stri
     for (addrinfo* rp = res; rp != nullptr; rp = rp->ai_next) {
         sock = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
         if (sock == OTEL_INVALID_SOCK) continue;
-        if (connect(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen)) == 0) {
+        if (connectWithTimeout(sock, rp->ai_addr, static_cast<int>(rp->ai_addrlen), 250)) {
             break;
         }
         OTEL_CLOSE_SOCK(sock);
@@ -351,6 +419,16 @@ bool TelemetryManager::sendHttpPost(const std::string& endpoint, const std::stri
     freeaddrinfo(res);
 
     if (sock == OTEL_INVALID_SOCK) return false;
+
+#ifdef _WIN32
+    DWORD tv = 500;
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&tv), sizeof(tv));
+#else
+    timeval tv{0, 500000};
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+#endif
 
     std::ostringstream req;
     req << "POST " << endpoint << " HTTP/1.1\r\n"
