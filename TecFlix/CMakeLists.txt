@@ -22,15 +22,16 @@ endif()
 find_package(Threads REQUIRED)
 set(TECFLIX_PLATFORM_LIBS Threads::Threads)
 if(WIN32)
+    add_compile_definitions(NOMINMAX)
     list(APPEND TECFLIX_PLATFORM_LIBS ws2_32)
 endif()
 
 # Fuentes del núcleo de Metadata y Observabilidad
 set(TECFLIX_CORE_SOURCES
-        common/src/TelemetryManager.cpp
-        services/metadata-api/src/VideoMetadata.cpp
-        services/metadata-api/src/MetadataService.cpp
-        services/metadata-api/src/MetadataController.cpp
+    common/src/TelemetryManager.cpp
+    services/metadata-api/src/VideoMetadata.cpp
+    services/metadata-api/src/MetadataService.cpp
+    services/metadata-api/src/MetadataController.cpp
 )
 
 if(TECFLIX_USE_MONGODB)
@@ -41,8 +42,8 @@ endif()
 add_library(tecflix_metadata_core STATIC ${TECFLIX_CORE_SOURCES})
 
 target_include_directories(tecflix_metadata_core PUBLIC
-        ${CMAKE_CURRENT_SOURCE_DIR}/common/include
-        ${CMAKE_CURRENT_SOURCE_DIR}/services/metadata-api/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/common/include
+    ${CMAKE_CURRENT_SOURCE_DIR}/services/metadata-api/include
 )
 
 target_link_libraries(tecflix_metadata_core PUBLIC ${TECFLIX_PLATFORM_LIBS})
@@ -61,9 +62,27 @@ if(TECFLIX_USE_MONGODB)
     endif()
 endif()
 
+# Núcleo de Usuarios con Árbol B en disco (se activa automáticamente al añadir Lote 2)
+set(TECFLIX_USER_SOURCES
+    services/user-api/src/DiskBTree.cpp
+    services/user-api/src/BTreeUserRepository.cpp
+)
+if(EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/services/user-api/src/DiskBTree.cpp")
+    add_library(tecflix_user_core STATIC ${TECFLIX_USER_SOURCES})
+    target_include_directories(tecflix_user_core PUBLIC
+        ${CMAKE_CURRENT_SOURCE_DIR}/common/include
+        ${CMAKE_CURRENT_SOURCE_DIR}/services/user-api/include
+    )
+    target_link_libraries(tecflix_user_core PUBLIC ${TECFLIX_PLATFORM_LIBS})
+endif()
+
 # Ejecutable principal del servidor TecFlix
 add_executable(tecflix-server src/main.cpp)
 target_link_libraries(tecflix-server PRIVATE tecflix_metadata_core)
+if(TARGET tecflix_user_core)
+    target_link_libraries(tecflix-server PRIVATE tecflix_user_core)
+    target_compile_definitions(tecflix-server PRIVATE TECFLIX_HAS_USER_BTREE)
+endif()
 
 # Pruebas unitarias y registro en CTest
 if(BUILD_TESTING)
@@ -77,6 +96,12 @@ if(BUILD_TESTING)
         add_executable(test_telemetry tests/test_telemetry.cpp)
         target_link_libraries(test_telemetry PRIVATE tecflix_metadata_core)
         add_test(NAME TelemetryUnitTests COMMAND test_telemetry)
+    endif()
+
+    if(TARGET tecflix_user_core AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/tests/test_user_api.cpp")
+        add_executable(test_user_api tests/test_user_api.cpp)
+        target_link_libraries(test_user_api PRIVATE tecflix_user_core tecflix_metadata_core)
+        add_test(NAME UserApiUnitTests COMMAND test_user_api)
     endif()
 
     add_test(NAME ServerCryptoSelfTest COMMAND tecflix-server --selftest)

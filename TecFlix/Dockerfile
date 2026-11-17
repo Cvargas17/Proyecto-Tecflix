@@ -1,5 +1,16 @@
 # ==============================================================================
-# Etapa 1: Compilación (Builder) con CMake, C++17 y mongo-cxx-driver oficial
+# Etapa 1: Compilación del Frontend React + TypeScript
+# ==============================================================================
+FROM node:20-alpine AS frontend-builder
+
+WORKDIR /frontend
+COPY frontend/package*.json ./
+RUN npm ci
+COPY frontend/ ./
+RUN npx vite build --outDir /frontend/dist
+
+# ==============================================================================
+# Etapa 2: Compilación (Builder) con CMake, C++17 y mongo-cxx-driver oficial
 # ==============================================================================
 FROM ubuntu:24.04 AS builder
 
@@ -46,7 +57,7 @@ RUN cmake -S . -B /build -G Ninja \
     && cmake --build /build --parallel
 
 # ==============================================================================
-# Etapa 2: Imagen de ejecución (Runtime) con librerías compartidas y FFmpeg
+# Etapa 3: Imagen de ejecución (Runtime) con librerías compartidas, FFmpeg y Web
 # ==============================================================================
 FROM ubuntu:24.04 AS runtime
 
@@ -62,14 +73,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 
 WORKDIR /app
 
-# Copiar binario compilado y librerías runtime de mongocxx/bsoncxx desde builder
+# Copiar binario compilado, librerías runtime y frontend construido
 COPY --from=builder /build/tecflix-server /app/tecflix-server
 COPY --from=builder /usr/local/lib/libmongocxx* /usr/local/lib/
 COPY --from=builder /usr/local/lib/libbsoncxx* /usr/local/lib/
+COPY --from=frontend-builder /frontend/dist /app/web/dist
 RUN ldconfig && /app/tecflix-server --selftest
 
 # Crear directorios de persistencia de medios
-RUN mkdir -p /app/data/videos /app/data/dash /app/web/dist
+RUN mkdir -p /app/data/videos /app/data/dash
 
 ENV PORT=8080 \
     MONGO_URI=mongodb://mongodb:27017 \

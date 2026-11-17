@@ -1,15 +1,26 @@
 /**
  * @file MetadataService.cpp
- * @brief Implementación de las reglas de negocio y control de acceso de `MetadataService`.
+ * @brief Implementación de las reglas de negocio, invariantes de dominio y control de acceso.
  */
 
 #include "MetadataService.hpp"
 #include "TelemetryManager.hpp"
 
 #include <algorithm>
+#include <cctype>
+#include <cmath>
 #include <sstream>
 
 namespace tecflix::metadata {
+
+namespace {
+
+bool isValidHexVideoId(const std::string& id) {
+    if (id.empty() || id.size() > 32) return false;
+    return std::all_of(id.begin(), id.end(), [](unsigned char c) { return std::isxdigit(c) != 0; });
+}
+
+} // namespace
 
 MetadataService::MetadataService(std::shared_ptr<IMetadataRepository> repository)
     : repo_(std::move(repository)) {}
@@ -41,13 +52,31 @@ std::string MetadataService::escapeJson(const std::string& input) {
 ServiceResponse MetadataService::registerVideo(VideoMetadata video) {
     observability::ScopedSpan span("MetadataService.registerVideo");
 
-    // Validación de campos mínimos indispensables
-    if (video.id.empty() || video.owner.empty() || video.title.empty()) {
-        span.setStatusCode(400);
-        return {400, "{\"error\":\"Missing required fields: id, owner, or title\"}"};
+    if (video.owner.empty()) {
+        span.setStatusCode(401);
+        return {401, "{\"error\":\"Authentication required: owner is missing\"}"};
     }
 
-    // Asignación por defecto y validación de visibilidad
+    if (!isValidHexVideoId(video.id)) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid video id: expected 1..32 hexadecimal characters\"}"};
+    }
+
+    if (video.title.empty() || video.title.size() > 120) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid title: must be between 1 and 120 characters\"}"};
+    }
+
+    if (std::isnan(video.duration) || video.duration < 0.0) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid duration: must be >= 0\"}"};
+    }
+
+    if (video.sizeBytes < 0) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid sizeBytes: must be >= 0\"}"};
+    }
+
     if (video.visibility.empty()) {
         video.visibility = "public";
     } else if (!isValidVisibility(video.visibility)) {
@@ -55,12 +84,16 @@ ServiceResponse MetadataService::registerVideo(VideoMetadata video) {
         return {400, "{\"error\":\"Invalid visibility. Expected 'public' or 'private'\"}"};
     }
 
-    // Asignación por defecto y validación de estado de empaquetado DASH
     if (video.dash.empty()) {
         video.dash = "pending";
     } else if (!isValidDashStatus(video.dash)) {
         span.setStatusCode(400);
         return {400, "{\"error\":\"Invalid dash status\"}"};
+    }
+
+    if (repo_->findById(video.id).has_value()) {
+        span.setStatusCode(409);
+        return {409, "{\"error\":\"Video metadata with this ID already exists\"}"};
     }
 
     if (!repo_->create(video)) {
@@ -75,9 +108,9 @@ ServiceResponse MetadataService::registerVideo(VideoMetadata video) {
 ServiceResponse MetadataService::getVideoById(const std::string& videoId, const std::string& requesterUsername) {
     observability::ScopedSpan span("MetadataService.getVideoById", "", {{"video.id", videoId}});
 
-    if (videoId.empty()) {
+    if (!isValidHexVideoId(videoId)) {
         span.setStatusCode(400);
-        return {400, "{\"error\":\"Video ID is required\"}"};
+        return {400, "{\"error\":\"Invalid video ID format\"}"};
     }
 
     auto found = repo_->findById(videoId);
@@ -86,7 +119,6 @@ ServiceResponse MetadataService::getVideoById(const std::string& videoId, const 
         return {404, "{\"error\":\"Video not found\"}"};
     }
 
-    // Control de privacidad: solo el propietario puede consultar videos marcados como "private"
     if (found->visibility == "private" && found->owner != requesterUsername) {
         span.setStatusCode(403);
         return {403, "{\"error\":\"Access denied to private video\"}"};
@@ -103,15 +135,15 @@ ServiceResponse MetadataService::listVideos(VideoQueryFilter filter) {
         filter.scope = "all";
     }
 
-    // El alcance "mine" exige que el usuario haya sido autenticado previamente
     if (filter.scope == "mine" && filter.requesterUsername.empty()) {
         span.setStatusCode(401);
         return {401, "{\"error\":\"Authentication required for scope=mine\"}"};
     }
 
-    // Normalización de límites de paginación para evitar consultas abusivas
-    filter.page = std::max(1, filter.page);
-    filter.limit = std::clamp(filter.limit, 1, 50);
+    if (filter.page < 1 || filter.limit < 1 || filter.limit > 50) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid pagination bounds: page >= 1 and 1 <= limit <= 50\"}"};
+    }
 
     PaginatedVideos pageResult = repo_->findPaginated(filter);
 
@@ -145,13 +177,17 @@ ServiceResponse MetadataService::updateVideoMetadata(const std::string& videoId,
         return {401, "{\"error\":\"Authentication required\"}"};
     }
 
+    if (!isValidHexVideoId(videoId)) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid video ID format\"}"};
+    }
+
     auto found = repo_->findById(videoId);
     if (!found.has_value()) {
         span.setStatusCode(404);
         return {404, "{\"error\":\"Video not found\"}"};
     }
 
-    // Autorización estricta: únicamente el propietario puede modificar metadatos
     if (found->owner != requesterUsername) {
         span.setStatusCode(403);
         return {403, "{\"error\":\"Only the owner can edit this video\"}"};
@@ -160,6 +196,10 @@ ServiceResponse MetadataService::updateVideoMetadata(const std::string& videoId,
     VideoMetadata updated = *found;
 
     if (!newTitle.empty()) {
+        if (newTitle.size() > 120) {
+            span.setStatusCode(400);
+            return {400, "{\"error\":\"Title cannot exceed 120 characters\"}"};
+        }
         updated.title = newTitle;
     }
 
@@ -191,7 +231,7 @@ ServiceResponse MetadataService::updateVideoMetadata(const std::string& videoId,
 ServiceResponse MetadataService::updateDashState(const std::string& videoId, const std::string& dashStatus) {
     observability::ScopedSpan span("MetadataService.updateDashState", "", {{"video.id", videoId}});
 
-    if (videoId.empty() || !isValidDashStatus(dashStatus)) {
+    if (!isValidHexVideoId(videoId) || !isValidDashStatus(dashStatus)) {
         span.setStatusCode(400);
         return {400, "{\"error\":\"Invalid videoId or dash status\"}"};
     }
@@ -213,13 +253,17 @@ ServiceResponse MetadataService::deleteVideo(const std::string& videoId, const s
         return {401, "{\"error\":\"Authentication required\"}"};
     }
 
+    if (!isValidHexVideoId(videoId)) {
+        span.setStatusCode(400);
+        return {400, "{\"error\":\"Invalid video ID format\"}"};
+    }
+
     auto found = repo_->findById(videoId);
     if (!found.has_value()) {
         span.setStatusCode(404);
         return {404, "{\"error\":\"Video not found\"}"};
     }
 
-    // Autorización estricta: únicamente el propietario puede eliminar el recurso
     if (found->owner != requesterUsername) {
         span.setStatusCode(403);
         return {403, "{\"error\":\"Only the owner can delete this video\"}"};

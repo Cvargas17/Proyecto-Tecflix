@@ -1,6 +1,6 @@
 /**
  * @file MetadataController.cpp
- * @brief Implementación del enrutamiento HTTP REST y extracción JSON de `MetadataController`.
+ * @brief Implementación del enrutamiento HTTP REST, propagación W3C y validación de parámetros.
  */
 
 #include "MetadataController.hpp"
@@ -11,6 +11,34 @@
 #include <chrono>
 
 namespace tecflix::metadata {
+
+namespace {
+
+bool parseStrictInt(const std::string& raw, int& out) {
+    if (raw.empty()) return false;
+    size_t idx = 0;
+    if (raw[0] == '-' || raw[0] == '+') idx = 1;
+    if (idx >= raw.size()) return false;
+    for (size_t i = idx; i < raw.size(); ++i) {
+        if (!std::isdigit(static_cast<unsigned char>(raw[i]))) return false;
+    }
+    try {
+        out = std::stoi(raw);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+bool isValidSortBy(const std::string& s) {
+    return s == "uploaded" || s == "title" || s == "author" || s == "owner";
+}
+
+bool isValidOrder(const std::string& o) {
+    return o == "asc" || o == "desc";
+}
+
+} // namespace
 
 MetadataController::MetadataController(std::shared_ptr<MetadataService> service)
     : service_(std::move(service)) {}
@@ -117,9 +145,19 @@ std::vector<std::string> MetadataController::extractJsonStringArray(const std::s
 }
 
 ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
-    std::string incomingTraceId = getHeaderIgnoreCase(req.headers, "X-Trace-Id");
-    observability::ScopedSpan span(req.method + " " + req.path, incomingTraceId,
-                                   {{"http.method", req.method}, {"http.route", req.path}});
+    std::string traceparent = getHeaderIgnoreCase(req.headers, "traceparent");
+    auto w3cCtx = observability::TelemetryManager::parseTraceparent(traceparent);
+    std::string incomingTraceId = w3cCtx.valid ? w3cCtx.traceId : getHeaderIgnoreCase(req.headers, "X-Trace-Id");
+
+    std::string routePattern = req.path;
+    if (req.path.rfind("/api/videos/", 0) == 0) {
+        routePattern = "/api/videos/{id}";
+    }
+
+    observability::ScopedSpan span(req.method + " " + routePattern,
+                                   incomingTraceId,
+                                   {{"http.method", req.method}, {"http.route", routePattern}},
+                                   w3cCtx.parentSpanId);
 
     std::string requester = getHeaderIgnoreCase(req.headers, "X-User");
     ServiceResponse response{404, "{\"error\":\"Endpoint not found\"}"};
@@ -129,22 +167,63 @@ ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
     } else if (req.method == "GET" && req.path == "/api/videos") {
         VideoQueryFilter filter;
         filter.requesterUsername = requester;
-        if (req.queryParams.count("scope")) filter.scope = req.queryParams.at("scope");
-        if (req.queryParams.count("sortBy")) filter.sortBy = req.queryParams.at("sortBy");
-        if (req.queryParams.count("order")) filter.order = req.queryParams.at("order");
+
+        if (req.queryParams.count("scope")) {
+            const std::string& sc = req.queryParams.at("scope");
+            if (sc != "all" && sc != "mine" && sc != "public") {
+                span.setStatusCode(400);
+                return {400, "{\"error\":\"Invalid scope. Expected 'all' or 'mine'\"}"};
+            }
+            filter.scope = (sc == "mine") ? "mine" : "all";
+        }
+        if (req.queryParams.count("sortBy")) {
+            const std::string& sb = req.queryParams.at("sortBy");
+            if (!isValidSortBy(sb)) {
+                span.setStatusCode(400);
+                return {400, "{\"error\":\"Invalid sortBy. Expected uploaded, title, author, or owner\"}"};
+            }
+            filter.sortBy = sb;
+        }
+        if (req.queryParams.count("order")) {
+            const std::string& ord = req.queryParams.at("order");
+            if (!isValidOrder(ord)) {
+                span.setStatusCode(400);
+                return {400, "{\"error\":\"Invalid order. Expected 'asc' or 'desc'\"}"};
+            }
+            filter.order = ord;
+        }
         if (req.queryParams.count("topic")) filter.topicFilter = req.queryParams.at("topic");
         if (req.queryParams.count("tag")) filter.tagFilter = req.queryParams.at("tag");
+
         if (req.queryParams.count("page")) {
-            try { filter.page = std::stoi(req.queryParams.at("page")); } catch (...) {}
+            int parsedPage = 0;
+            if (!parseStrictInt(req.queryParams.at("page"), parsedPage) || parsedPage < 1) {
+                span.setStatusCode(400);
+                return {400, "{\"error\":\"Invalid page parameter: must be an integer >= 1\"}"};
+            }
+            filter.page = parsedPage;
         }
         if (req.queryParams.count("limit")) {
-            try { filter.limit = std::stoi(req.queryParams.at("limit")); } catch (...) {}
+            int parsedLimit = 0;
+            if (!parseStrictInt(req.queryParams.at("limit"), parsedLimit) || parsedLimit < 1 || parsedLimit > 50) {
+                span.setStatusCode(400);
+                return {400, "{\"error\":\"Invalid limit parameter: must be between 1 and 50\"}"};
+            }
+            filter.limit = parsedLimit;
         }
+
         response = service_->listVideos(filter);
     } else if (req.method == "POST" && req.path == "/api/videos") {
+        std::string bodyOwner = extractJsonString(req.body, "owner");
+        std::string effectiveOwner = requester.empty() ? bodyOwner : requester;
+        if (effectiveOwner.empty()) {
+            span.setStatusCode(401);
+            return {401, "{\"error\":\"Authentication required to create video metadata\"}"};
+        }
+
         VideoMetadata video;
         video.id = extractJsonString(req.body, "id");
-        video.owner = requester.empty() ? extractJsonString(req.body, "owner") : requester;
+        video.owner = effectiveOwner;
         video.title = extractJsonString(req.body, "title");
         video.topic = extractJsonString(req.body, "topic");
         video.tags = extractJsonStringArray(req.body, "tags");
@@ -166,7 +245,13 @@ ServiceResponse MetadataController::handleRequest(const HttpRequest& req) {
             if (req.method == "GET") {
                 response = service_->getVideoById(videoId, requester);
             } else if (req.method == "PUT" || req.method == "PATCH") {
+                bool hasTitle = hasJsonKey(req.body, "title");
                 std::string newTitle = extractJsonString(req.body, "title");
+                if (hasTitle && (newTitle.empty() || newTitle.size() > 120)) {
+                    span.setStatusCode(400);
+                    return {400, "{\"error\":\"Title must be between 1 and 120 characters\"}"};
+                }
+
                 std::string newVisibility = extractJsonString(req.body, "visibility");
                 std::string newTopic = extractJsonString(req.body, "topic");
                 bool updateTopic = hasJsonKey(req.body, "topic");

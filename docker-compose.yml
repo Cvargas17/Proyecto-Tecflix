@@ -1,18 +1,57 @@
 services:
-  mongodb:
+  mongodb-primary:
     image: mongo:7
-    container_name: tecflix-mongodb
+    container_name: tecflix-mongo-primary
     restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
     ports:
       - "27017:27017"
     volumes:
-      - mongodb_data:/data/db
+      - mongodb_primary_data:/data/db
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
-      interval: 10s
+      interval: 5s
       timeout: 5s
-      retries: 5
-      start_period: 10s
+      retries: 10
+
+  mongodb-secondary:
+    image: mongo:7
+    container_name: tecflix-mongo-secondary
+    restart: unless-stopped
+    command: ["mongod", "--replSet", "rs0", "--bind_ip_all"]
+    volumes:
+      - mongodb_secondary_data:/data/db
+    healthcheck:
+      test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mongodb-init:
+    image: mongo:7
+    container_name: tecflix-mongo-init
+    depends_on:
+      mongodb-primary:
+        condition: service_healthy
+      mongodb-secondary:
+        condition: service_healthy
+    entrypoint:
+      - bash
+      - -c
+      - |
+        mongosh --host mongodb-primary:27017 --eval '
+          try {
+            rs.status();
+          } catch (e) {
+            rs.initiate({
+              _id: "rs0",
+              members: [
+                { _id: 0, host: "mongodb-primary:27017", priority: 2 },
+                { _id: 1, host: "mongodb-secondary:27017", priority: 1 }
+              ]
+            });
+          }
+        '
 
   aspire-dashboard:
     image: mcr.microsoft.com/dotnet/aspire-dashboard:9.0
@@ -27,29 +66,65 @@ services:
       - DOTNET_DASHBOARD_OTLP_HTTP_ENDPOINT_URL=http://0.0.0.0:4318
       - DOTNET_DASHBOARD_OTLP_ENDPOINT_URL=http://0.0.0.0:4317
 
-  tecflix-server:
+  tecflix-node-1:
     build:
       context: ./TecFlix
       dockerfile: Dockerfile
-    container_name: tecflix-server
+    container_name: tecflix-node-1
     restart: unless-stopped
     ports:
-      - "8080:8080"
+      - "8081:8080"
     environment:
       - PORT=8080
-      - MONGO_URI=mongodb://mongodb:27017
+      - MONGO_URI=mongodb://mongodb-primary:27017,mongodb-secondary:27017/?replicaSet=rs0
       - MONGO_DB=tecflix
       - MONGO_COLLECTION=videos
       - OTLP_HOST=aspire-dashboard
       - OTLP_PORT=4318
     volumes:
-      - tecflix_data:/app/data
+      - tecflix_shared_data:/app/data
     depends_on:
-      mongodb:
-        condition: service_healthy
+      mongodb-init:
+        condition: service_completed_successfully
       aspire-dashboard:
         condition: service_started
 
+  tecflix-node-2:
+    build:
+      context: ./TecFlix
+      dockerfile: Dockerfile
+    container_name: tecflix-node-2
+    restart: unless-stopped
+    environment:
+      - PORT=8080
+      - MONGO_URI=mongodb://mongodb-primary:27017,mongodb-secondary:27017/?replicaSet=rs0
+      - MONGO_DB=tecflix
+      - MONGO_COLLECTION=videos
+      - OTLP_HOST=aspire-dashboard
+      - OTLP_PORT=4318
+    volumes:
+      - tecflix_shared_data:/app/data
+    depends_on:
+      mongodb-init:
+        condition: service_completed_successfully
+      aspire-dashboard:
+        condition: service_started
+
+  nginx-lb:
+    image: nginx:1.27-alpine
+    container_name: tecflix-nginx-lb
+    restart: unless-stopped
+    ports:
+      - "8080:80"
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    depends_on:
+      tecflix-node-1:
+        condition: service_healthy
+      tecflix-node-2:
+        condition: service_healthy
+
 volumes:
-  mongodb_data:
-  tecflix_data:
+  mongodb_primary_data:
+  mongodb_secondary_data:
+  tecflix_shared_data:

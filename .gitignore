@@ -27,6 +27,10 @@ playwright-report/
 *.gcda
 *.gcno
 *.gcov
+*.bin
+*.dat
+*.idx
+*.db
 prueba.bin
 
 # Datos locales en tiempo de ejecución y archivos multimedia

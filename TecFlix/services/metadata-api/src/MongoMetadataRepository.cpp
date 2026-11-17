@@ -16,6 +16,7 @@
 #include <mongocxx/client.hpp>
 #include <mongocxx/collection.hpp>
 #include <mongocxx/database.hpp>
+#include <mongocxx/exception/bulk_write_exception.hpp>
 #include <mongocxx/exception/exception.hpp>
 #include <mongocxx/options/find.hpp>
 
@@ -128,6 +129,9 @@ bool MongoMetadataRepository::create(const VideoMetadata& video) {
         bool ok = res && res->result().inserted_count() == 1;
         span.setStatusCode(ok ? 200 : 500);
         return ok;
+    } catch (const mongocxx::bulk_write_exception& e) {
+        span.setStatusCode(e.code().value() == 11000 ? 409 : 500);
+        return false;
     } catch (const mongocxx::exception&) {
         span.setStatusCode(500);
         return false;
