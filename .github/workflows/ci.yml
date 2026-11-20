@@ -166,15 +166,22 @@ jobs:
               # Abrir interfaz React y mostrar formulario de registro
               page.goto(BASE, wait_until="networkidle")
               page.get_by_role("button", name="Log in").click()
+              page.wait_for_timeout(400)
 
-              register_btn = page.get_by_role("button", name="Register")
-              if register_btn.count() == 0:
-                  register_btn = page.locator("button, a, [role='tab']").filter(has_text="Register").first
-              if register_btn.count() == 0:
-                  register_btn = page.locator("button, a, [role='tab']").filter(has_text="Sign up").first
+              auth_toggle = page.locator("button, a, [role='tab']").filter(
+                  has_text=r"(?i)(register|sign up|create account|registrarse|crear cuenta)"
+              ).first
 
-              register_btn.wait_for(state="visible", timeout=10000)
-              register_btn.click()
+              if auth_toggle.count() == 0:
+                  print("=== DEBUG PAGE TEXT ===")
+                  print(page.locator("body").inner_text())
+                  print("=== DEBUG BUTTONS/LINKS ===")
+                  for el in page.locator("button, a, [role='tab']").all():
+                      print(repr(el.inner_text()))
+                  raise AssertionError("No se encontró un control visible para cambiar a registro")
+
+              auth_toggle.wait_for(state="visible", timeout=10000)
+              auth_toggle.click()
               inputs = page.locator("input")
               inputs.nth(0).fill("e2e_user")
               inputs.nth(1).fill("password123")
