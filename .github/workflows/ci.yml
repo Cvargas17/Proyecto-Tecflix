@@ -175,20 +175,36 @@ jobs:
               if auth_toggle.count() == 0:
                   print("=== DEBUG PAGE TEXT ===")
                   print(page.locator("body").inner_text())
-                  print("=== DEBUG BUTTONS/LINKS ===")
-                  for el in page.locator("button, a, [role='tab']").all():
-                      print(repr(el.inner_text()))
                   raise AssertionError("No se encontró un control visible para cambiar a registro")
 
               auth_toggle.wait_for(state="visible", timeout=10000)
               auth_toggle.click()
-              inputs = page.locator("input")
+              page.wait_for_timeout(300)
+
+              inputs = page.locator(".modal input, input")
               inputs.nth(0).fill("e2e_user")
               inputs.nth(1).fill("password123")
-              page.locator("form button[type='submit'], .modal button.red").first.click()
-              page.wait_for_timeout(800)
 
-              # Verificar que la cuota fija aparece en el encabezado
+              submit_btn = page.locator(".modal button[type='submit'], .modal button.red, .modal button").filter(
+                  has_text=re.compile(r"(create account|register|sign up|log in|submit)", re.IGNORECASE)
+              ).first
+              if submit_btn.count() > 0:
+                  submit_btn.click()
+              else:
+                  inputs.nth(1).press("Enter")
+
+              page.wait_for_timeout(1000)
+
+              modal = page.locator(".modal.open")
+              if modal.count() > 0 and modal.first.is_visible():
+                  print("=== DEBUG MODAL STILL OPEN ===")
+                  print(modal.first.inner_text())
+                  close_btn = modal.first.locator("button").filter(has_text=re.compile(r"^(×|x|close)$", re.IGNORECASE)).first
+                  if close_btn.count() > 0:
+                      close_btn.click()
+                  modal.first.wait_for(state="hidden", timeout=5000)
+
+              # Verificar que el usuario aparece en la interfaz
               assert "e2e_user" in page.content()
 
               # Navegar a la pestaña Upload y subir un archivo MP4 de prueba
