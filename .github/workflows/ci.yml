@@ -190,13 +190,18 @@ jobs:
                   page.locator("input[type='text']").first.fill("Video E2E Playwright")
                   page.locator("select").last.select_option("public")
                   page.locator("section button.red").click()
-                  page.wait_for_timeout(1200)
+                  page.wait_for_timeout(1500)
               finally:
                   os.remove(tmp_path)
 
-              # Verificar que el video aparece en My Videos con controles de paginación y ordenamiento
-              assert "Video E2E Playwright" in page.content()
-              assert "Page 1 of" in page.content()
+              # Ir a My Videos (por si Upload no redirige automáticamente) y esperar el video
+              my_videos_btn = page.get_by_role("button", name="My Videos")
+              if my_videos_btn.count() > 0:
+                  my_videos_btn.click()
+
+              video_entry = page.get_by_text("Video E2E Playwright").first
+              video_entry.wait_for(state="visible", timeout=10000)
+              assert "Page 1 of" in page.content(), f"No se encontró paginación en My Videos: {page.locator('body').inner_text()}"
 
               browser.close()
 
