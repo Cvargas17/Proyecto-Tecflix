@@ -31,7 +31,7 @@ jobs:
       - name: Install C++ toolchain and coverage dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y cmake ninja-build g++ gcovr mingw-w64 zip
+          sudo apt-get install -y --no-install-recommends cmake ninja-build g++ gcovr mingw-w64 zip
 
       - name: Configure and build with coverage instrumentation
         run: |
