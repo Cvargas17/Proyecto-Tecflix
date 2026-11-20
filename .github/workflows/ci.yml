@@ -148,7 +148,7 @@ jobs:
           sleep 2
 
           python3 - << 'EOF'
-          import os, re, tempfile, requests
+          import os, tempfile, requests
           from playwright.sync_api import sync_playwright
 
           BASE = "http://127.0.0.1:8080"
@@ -163,36 +163,17 @@ jobs:
               context = browser.new_context()
               page = context.new_page()
 
-              # Abrir interfaz React y cambiar a modo registro ("Create account")
+              # Abrir interfaz React, llenar credenciales dentro de .modal y pulsar "Create account"
               page.goto(BASE, wait_until="networkidle")
               page.get_by_role("button", name="Log in").click()
-              page.wait_for_timeout(300)
-
-              auth_toggle = page.locator(".modal button, .modal a, button, a").filter(
-                  has_text=re.compile(r"^(create account|register|sign up)$", re.IGNORECASE)
-              ).first
-              auth_toggle.wait_for(state="visible", timeout=10000)
-              auth_toggle.click()
-              page.wait_for_timeout(300)
-
-              inputs = page.locator(".modal input, input")
-              inputs.nth(0).fill("e2e_user")
-              inputs.nth(1).fill("password123")
-
-              submit_btn = page.locator(".modal button[type='submit']").first
-              if submit_btn.count() > 0:
-                  submit_btn.click()
-              else:
-                  inputs.nth(1).press("Enter")
-
-              page.wait_for_timeout(1000)
 
               modal = page.locator(".modal.open")
-              if modal.count() > 0 and modal.first.is_visible():
-                  print("=== DEBUG MODAL HTML ===")
-                  print(modal.first.inner_html())
-                  raise AssertionError(f"El modal sigue abierto tras enviar registro: {modal.first.inner_text()}")
+              modal.wait_for(state="visible", timeout=10000)
+              modal.locator("input[type='text']").fill("e2e_user")
+              modal.locator("input[type='password']").fill("password123")
+              modal.get_by_role("button", name="Create account").click()
 
+              modal.wait_for(state="hidden", timeout=10000)
               assert "e2e_user" in page.content(), "No se reflejó el usuario registrado en la UI"
 
               # Navegar a la pestaña Upload y subir un archivo MP4 de prueba
