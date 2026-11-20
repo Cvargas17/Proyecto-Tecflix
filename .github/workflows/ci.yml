@@ -163,10 +163,18 @@ jobs:
               context = browser.new_context()
               page = context.new_page()
 
-              # Abrir interfaz React y registrar cuenta desde el modal
-              page.goto(BASE)
+              # Abrir interfaz React y mostrar formulario de registro
+              page.goto(BASE, wait_until="networkidle")
               page.get_by_role("button", name="Log in").click()
-              page.get_by_role("button", name="Register").click()
+
+              register_btn = page.get_by_role("button", name="Register")
+              if register_btn.count() == 0:
+                  register_btn = page.locator("button, a, [role='tab']").filter(has_text="Register").first
+              if register_btn.count() == 0:
+                  register_btn = page.locator("button, a, [role='tab']").filter(has_text="Sign up").first
+
+              register_btn.wait_for(state="visible", timeout=10000)
+              register_btn.click()
               inputs = page.locator("input")
               inputs.nth(0).fill("e2e_user")
               inputs.nth(1).fill("password123")
