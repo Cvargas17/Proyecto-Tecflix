@@ -148,7 +148,7 @@ jobs:
           sleep 2
 
           python3 - << 'EOF'
-          import tempfile, os, requests
+          import re, tempfile, os, requests
           from playwright.sync_api import sync_playwright
 
           BASE = "http://127.0.0.1:8080"
@@ -169,7 +169,7 @@ jobs:
               page.wait_for_timeout(400)
 
               auth_toggle = page.locator("button, a, [role='tab']").filter(
-                  has_text=r"(?i)(register|sign up|create account|registrarse|crear cuenta)"
+                  has_text=re.compile(r"(create account|register|sign up|registrarse|crear cuenta)", re.IGNORECASE)
               ).first
 
               if auth_toggle.count() == 0:
