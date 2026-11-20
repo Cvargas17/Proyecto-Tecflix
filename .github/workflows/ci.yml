@@ -194,12 +194,18 @@ jobs:
               finally:
                   os.remove(tmp_path)
 
-              # Ir a My Videos (por si Upload no redirige automáticamente) y esperar el video
+              # Ir a My Videos (por si Upload no redirige automáticamente)
               my_videos_btn = page.get_by_role("button", name="My Videos")
               if my_videos_btn.count() > 0:
                   my_videos_btn.click()
+                  page.wait_for_timeout(800)
 
               video_entry = page.get_by_text("Video E2E Playwright").first
+              if video_entry.count() == 0:
+                  print("=== DEBUG UPLOAD/MY VIDEOS PAGE TEXT ===")
+                  print(page.locator("body").inner_text())
+                  raise AssertionError("No apareció 'Video E2E Playwright' tras intentar subir el archivo")
+
               video_entry.wait_for(state="visible", timeout=10000)
               assert "Page 1 of" in page.content(), f"No se encontró paginación en My Videos: {page.locator('body').inner_text()}"
 
