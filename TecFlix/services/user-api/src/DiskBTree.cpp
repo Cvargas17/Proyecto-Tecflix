@@ -8,9 +8,79 @@
 #include <fstream>
 #include <mutex>
 
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
+#include <fcntl.h>
+#include <sys/file.h>
+#include <unistd.h>
+#endif
+
 namespace fs = std::filesystem;
 
 namespace tecflix::users {
+
+namespace {
+
+/**
+ * @class CrossProcessFileLock
+ * @brief Bloqueo exclusivo entre procesos del SO (RAII) para coordinar múltiples nodos V2.0
+ *        sobre el mismo archivo binario de índice y datos.
+ */
+class CrossProcessFileLock {
+public:
+    explicit CrossProcessFileLock(const std::string& basePath) {
+        const std::string lockPath = basePath + ".lock";
+#ifdef _WIN32
+        handle_ = CreateFileA(lockPath.c_str(),
+                              GENERIC_READ | GENERIC_WRITE,
+                              FILE_SHARE_READ | FILE_SHARE_WRITE,
+                              nullptr,
+                              OPEN_ALWAYS,
+                              FILE_ATTRIBUTE_NORMAL,
+                              nullptr);
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            OVERLAPPED ov{};
+            LockFileEx(handle_, LOCKFILE_EXCLUSIVE_LOCK, 0, MAXDWORD, MAXDWORD, &ov);
+        }
+#else
+        fd_ = open(lockPath.c_str(), O_CREAT | O_RDWR, 0666);
+        if (fd_ >= 0) {
+            flock(fd_, LOCK_EX);
+        }
+#endif
+    }
+
+    ~CrossProcessFileLock() {
+#ifdef _WIN32
+        if (handle_ != INVALID_HANDLE_VALUE) {
+            OVERLAPPED ov{};
+            UnlockFileEx(handle_, 0, MAXDWORD, MAXDWORD, &ov);
+            CloseHandle(handle_);
+        }
+#else
+        if (fd_ >= 0) {
+            flock(fd_, LOCK_UN);
+            close(fd_);
+        }
+#endif
+    }
+
+    CrossProcessFileLock(const CrossProcessFileLock&) = delete;
+    CrossProcessFileLock& operator=(const CrossProcessFileLock&) = delete;
+
+private:
+#ifdef _WIN32
+    HANDLE handle_{INVALID_HANDLE_VALUE};
+#else
+    int fd_{-1};
+#endif
+};
+
+} // namespace
 
 int DiskBTree::compareKeys(const char* a, const char* b) {
     for (size_t i = 0; i < USERNAME_MAX_LEN; ++i) {
@@ -36,6 +106,7 @@ DiskBTree::DiskBTree(const std::string& idxFile, const std::string& datFile)
     if (idxPath.has_parent_path()) fs::create_directories(idxPath.parent_path(), ec);
     if (datPath.has_parent_path()) fs::create_directories(datPath.parent_path(), ec);
 
+    CrossProcessFileLock procLock(indexFile_);
     {
         std::ofstream idx(indexFile_, std::ios::app | std::ios::binary);
         std::ofstream dat(dataFile_, std::ios::app | std::ios::binary);
@@ -53,6 +124,17 @@ DiskBTree::DiskBTree(const std::string& idxFile, const std::string& datFile)
         IndexHeader header{};
         checkIdx.read(reinterpret_cast<char*>(&header), sizeof(IndexHeader));
         rootOffset_ = header.root_offset;
+    }
+}
+
+void DiskBTree::refreshHeader() const {
+    std::ifstream checkIdx(indexFile_, std::ios::binary);
+    if (!checkIdx) return;
+    IndexHeader header{};
+    checkIdx.read(reinterpret_cast<char*>(&header), sizeof(IndexHeader));
+    if (checkIdx.gcount() == static_cast<std::streamsize>(sizeof(IndexHeader)) &&
+        header.root_offset >= static_cast<int64_t>(sizeof(IndexHeader))) {
+        const_cast<DiskBTree*>(this)->rootOffset_ = header.root_offset;
     }
 }
 
@@ -418,6 +500,8 @@ void DiskBTree::removeInternal(int64_t nodeOffset, const char* key) {
 bool DiskBTree::insertUser(const UserRecord& user) {
     tecflix::observability::ScopedSpan span("btree.lookup", "", {{"btree.op", "insert"}, {"user", user.username}});
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
 
     char key[USERNAME_MAX_LEN];
     copyKey(key, user.username);
@@ -436,6 +520,8 @@ bool DiskBTree::insertUser(const UserRecord& user) {
 std::optional<UserRecord> DiskBTree::getUser(const std::string& username) const {
     tecflix::observability::ScopedSpan span("btree.lookup", "", {{"btree.op", "get"}, {"user", username}});
     std::shared_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
 
     char key[USERNAME_MAX_LEN];
     copyKey(key, username);
@@ -459,6 +545,8 @@ bool DiskBTree::updateCredentials(const std::string& username,
                                   const std::string& newPasswordHash) {
     tecflix::observability::ScopedSpan span("btree.lookup", "", {{"btree.op", "update"}, {"user", username}});
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
 
     char key[USERNAME_MAX_LEN];
     copyKey(key, username);
@@ -474,7 +562,6 @@ bool DiskBTree::updateCredentials(const std::string& username,
     file.seekg(*offset);
     file.read(reinterpret_cast<char*>(&user), sizeof(UserRecord));
 
-    // La clave username y la cuota quota_bytes son estrictamente inmutables
     std::memset(user.salt, 0, sizeof(user.salt));
     std::strncpy(user.salt, newSalt.c_str(), sizeof(user.salt) - 1);
 
@@ -491,6 +578,8 @@ bool DiskBTree::updateCredentials(const std::string& username,
 bool DiskBTree::deleteUser(const std::string& username) {
     tecflix::observability::ScopedSpan span("btree.lookup", "", {{"btree.op", "delete"}, {"user", username}});
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
 
     char key[USERNAME_MAX_LEN];
     copyKey(key, username);
@@ -515,6 +604,8 @@ bool DiskBTree::deleteUser(const std::string& username) {
 bool DiskBTree::reserveQuota(const std::string& username, uint64_t bytesToAdd) {
     tecflix::observability::ScopedSpan span("btree.lookup", "", {{"btree.op", "reserveQuota"}, {"user", username}});
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
 
     char key[USERNAME_MAX_LEN];
     copyKey(key, username);
@@ -545,6 +636,8 @@ bool DiskBTree::reserveQuota(const std::string& username, uint64_t bytesToAdd) {
 
 bool DiskBTree::releaseQuota(const std::string& username, uint64_t bytesToRelease) {
     std::unique_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
 
     char key[USERNAME_MAX_LEN];
     copyKey(key, username);

@@ -18,7 +18,8 @@ private:
     static int compareKeys(const char* a, const char* b);
     static void copyKey(char dest[USERNAME_MAX_LEN], const std::string& src);
 
-    // E/S binaria en disco
+    // E/S binaria en disco y sincronización multi-nodo
+    void refreshHeader() const;
     void saveHeader();
     void writeNode(int64_t offset, const BTreeNode& node);
     BTreeNode readNode(int64_t offset) const;

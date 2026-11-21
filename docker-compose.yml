@@ -92,6 +92,8 @@
       - MONGO_COLLECTION=videos
       - OTLP_HOST=otel-collector
       - OTLP_PORT=4318
+      - NODE_NAME=tecflix-node-1
+      - SESSION_SECRET=tecflix-v2-cluster-secret
     volumes:
       - tecflix_shared_data:/app/data
     depends_on:
@@ -113,6 +115,8 @@
       - MONGO_COLLECTION=videos
       - OTLP_HOST=otel-collector
       - OTLP_PORT=4318
+      - NODE_NAME=tecflix-node-2
+      - SESSION_SECRET=tecflix-v2-cluster-secret
     volumes:
       - tecflix_shared_data:/app/data
     depends_on:
