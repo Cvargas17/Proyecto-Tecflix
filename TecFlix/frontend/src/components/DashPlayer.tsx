@@ -31,8 +31,10 @@ export default function DashPlayer({ video }: { video: Video }) {
 
   const note: Record<Video['dash'], string> = {
     ready: 'Streaming with MPEG-DASH (dash.js)',
+    pending: 'Preparing adaptive stream… playing the original file meanwhile',
     processing: 'Preparing adaptive stream… playing the original file meanwhile',
     failed: 'DASH packaging failed — playing the original file',
+    error: 'DASH packaging failed — playing the original file',
     unavailable: 'DASH unavailable (ffmpeg not installed on the server) — playing the original file',
   };
 

@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from 'react';
 import { api } from '../api';
-import { fmtDate, fmtDuration, fmtResolution, fmtSize } from '../format';
+import { fmtDate, fmtDuration, fmtSize } from '../format';
 import type { Video, Visibility } from '../types';
 import DashPlayer from './DashPlayer';
 import Modal from './Modal';
@@ -16,9 +16,14 @@ export default function PlayerModal({ videoId, onClose }: Props) {
   const [title, setTitle] = useState('');
   const [visibility, setVisibility] = useState<Visibility>('private');
 
+  const [topic, setTopic] = useState('');
+  const [tags, setTags] = useState('');
+
   const apply = useCallback((v: Video) => {
     setVideo(v);
     setTitle(v.title);
+    setTopic(v.topic);
+    setTags(v.tags.join(', '));
     setVisibility(v.visibility);
   }, []);
 
@@ -36,12 +41,10 @@ export default function PlayerModal({ videoId, onClose }: Props) {
     return () => clearInterval(t);
   }, [processing, videoId]);
 
-  const update = async (fields: { title?: string; visibility?: Visibility }) => {
+  const update = async (fields: { title?: string; topic?: string; tags?: string[]; visibility?: Visibility }) => {
     try {
-      const v = await api.update(videoId, fields);
-      setVideo((old) => (old ? { ...v, dash: old.dash } : v));
-      setTitle(v.title);
-      setVisibility(v.visibility);
+      await api.update(videoId, fields);
+      apply(await api.get(videoId));
     } catch (e) {
       alert(e instanceof Error ? e.message : 'Update failed');
     }
@@ -60,19 +63,13 @@ export default function PlayerModal({ videoId, onClose }: Props) {
   if (error) return <Modal onClose={onClose}><div className="err">{error}</div></Modal>;
   if (!video) return <Modal onClose={onClose}><div className="empty">Loading…</div></Modal>;
 
-  const m = video.meta;
   const rows: [string, string][] = [
-    ['File name', m.filename],
-    ['File size', fmtSize(m.size)],
-    ['Format', m.mime],
-    ['Duration', fmtDuration(m.duration)],
-    ['Resolution', fmtResolution(m.width, m.height)],
-    ['Video codec', m.vcodec || 'Unknown'],
-    ['Audio codec', m.acodec || 'None / unknown'],
-    ['Container brand', m.brand || 'Unknown'],
-    ['Tracks', m.tracks ? String(m.tracks) : 'Unknown'],
-    ['Average bitrate', m.bitrate ? `${(m.bitrate / 1e6).toFixed(2)} Mbit/s` : 'Unknown'],
-    ['Media created', fmtDate(m.created)],
+    ['Author', video.owner],
+    ['Title', video.title],
+    ['Topic', video.topic || '—'],
+    ['Tags', video.tags.length ? video.tags.join(', ') : '—'],
+    ['Duration', fmtDuration(video.duration)],
+    ['File size', fmtSize(video.sizeBytes)],
     ['Uploaded', fmtDate(video.uploaded)],
     ['Visibility', video.visibility],
     ['Streaming', video.dash],
@@ -84,11 +81,21 @@ export default function PlayerModal({ videoId, onClose }: Props) {
       <h2 style={{ marginTop: 14 }}>{video.title}</h2>
       <div className="dim">Uploaded by {video.owner} on {fmtDate(video.uploaded)}</div>
 
-      {video.isOwner && (
+      {video.canEdit && (
         <>
           <div className="row">
             <input type="text" value={title} maxLength={120} onChange={(e) => setTitle(e.target.value)} />
             <button className="btn" onClick={() => void update({ title })}>Rename</button>
+          </div>
+          <div className="row">
+            <input type="text" value={topic} maxLength={60} placeholder="Topic" onChange={(e) => setTopic(e.target.value)} />
+            <input type="text" value={tags} placeholder="Tags (comma separated)" onChange={(e) => setTags(e.target.value)} />
+            <button
+              className="btn"
+              onClick={() => void update({ topic, tags: tags.split(',').map((t) => t.trim()).filter(Boolean) })}
+            >
+              Save topic &amp; tags
+            </button>
           </div>
           <div className="row">
             <label>Visibility</label>

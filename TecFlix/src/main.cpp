@@ -303,6 +303,20 @@ static vector<string> splitTabs(const string& line) {
     }
     return f;
 }
+static void saveVideos();
+
+/// Quita un video del indice local y de videos.db (idempotente). Con MongoDB el repositorio remoto
+/// borra su documento, pero el indice local seguia guardandolo y al reiniciar se re-sincronizaba a Mongo.
+static void eraseVideoLocal(const string& id) {
+    std::lock_guard<std::mutex> g(gMutex);
+    auto it = gVideoIndex.find(id);
+    if (it == gVideoIndex.end()) return;
+    gVideos.erase(gVideos.begin() + static_cast<std::ptrdiff_t>(it->second));
+    gVideoIndex.clear();
+    for (size_t i = 0; i < gVideos.size(); ++i) gVideoIndex[gVideos[i].id] = i;
+    saveVideos();
+}
+
 static void saveVideos() {  // caller holds gMutex
     std::ofstream o(DATA_DIR / "videos.db", std::ios::trunc);
     for (auto& v : gVideos)
@@ -1092,6 +1106,7 @@ static void route(sock_t s, Req& r) {
             std::error_code ec;
             if (!deletedFile.empty()) fs::remove(DATA_DIR / "videos" / deletedFile, ec);
             fs::remove_all(DATA_DIR / "dash" / deletedId, ec);
+            eraseVideoLocal(deletedId);
             if (gUserRepository && !deletedOwner.empty() && deletedSize > 0) {
                 gUserRepository->releaseQuota(deletedOwner, deletedSize);
             }

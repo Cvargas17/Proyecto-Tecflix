@@ -1,4 +1,4 @@
-services:
+﻿services:
   mongodb-primary:
     image: mongo:7
     container_name: tecflix-mongo-primary
@@ -66,6 +66,17 @@ services:
       - DOTNET_DASHBOARD_OTLP_HTTP_ENDPOINT_URL=http://0.0.0.0:4318
       - DOTNET_DASHBOARD_OTLP_ENDPOINT_URL=http://0.0.0.0:4317
 
+  otel-collector:
+    image: otel/opentelemetry-collector:0.116.1
+    container_name: tecflix-otel-collector
+    restart: unless-stopped
+    command: ["--config=/etc/otelcol/config.yaml"]
+    volumes:
+      - ./otel/collector-config.yaml:/etc/otelcol/config.yaml:ro
+    depends_on:
+      aspire-dashboard:
+        condition: service_started
+
   tecflix-node-1:
     build:
       context: ./TecFlix
@@ -79,14 +90,14 @@ services:
       - MONGO_URI=mongodb://mongodb-primary:27017,mongodb-secondary:27017/?replicaSet=rs0
       - MONGO_DB=tecflix
       - MONGO_COLLECTION=videos
-      - OTLP_HOST=aspire-dashboard
+      - OTLP_HOST=otel-collector
       - OTLP_PORT=4318
     volumes:
       - tecflix_shared_data:/app/data
     depends_on:
       mongodb-init:
         condition: service_completed_successfully
-      aspire-dashboard:
+      otel-collector:
         condition: service_started
 
   tecflix-node-2:
@@ -100,14 +111,14 @@ services:
       - MONGO_URI=mongodb://mongodb-primary:27017,mongodb-secondary:27017/?replicaSet=rs0
       - MONGO_DB=tecflix
       - MONGO_COLLECTION=videos
-      - OTLP_HOST=aspire-dashboard
+      - OTLP_HOST=otel-collector
       - OTLP_PORT=4318
     volumes:
       - tecflix_shared_data:/app/data
     depends_on:
       mongodb-init:
         condition: service_completed_successfully
-      aspire-dashboard:
+      otel-collector:
         condition: service_started
 
   nginx-lb:

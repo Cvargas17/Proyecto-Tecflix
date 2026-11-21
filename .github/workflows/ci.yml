@@ -165,12 +165,11 @@ jobs:
               # Abrir interfaz React y registrar cuenta desde el modal
               page.goto(BASE)
               page.get_by_role("button", name="Log in").click()
-              page.get_by_role("button", name="Register").click()
-              inputs = page.locator("input")
+              inputs = page.locator(".modal input")
               inputs.nth(0).fill("e2e_user")
               inputs.nth(1).fill("password123")
-              page.locator("form button[type='submit'], .modal button.red").first.click()
-              page.wait_for_timeout(800)
+              page.get_by_role("button", name="Create account").click()
+              page.wait_for_selector(".modal", state="detached")
 
               # Verificar que la cuota fija aparece en el encabezado
               assert "e2e_user" in page.content()

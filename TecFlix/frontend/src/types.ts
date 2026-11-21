@@ -1,30 +1,20 @@
 export type Visibility = 'public' | 'private';
-export type DashStatus = 'unavailable' | 'processing' | 'ready' | 'failed';
+export type DashStatus = 'unavailable' | 'pending' | 'processing' | 'ready' | 'failed' | 'error';
 
-export interface VideoMeta {
-  filename: string;
-  size: number;
-  mime: string;
-  duration: number;
-  width: number;
-  height: number;
-  vcodec: string;
-  acodec: string;
-  brand: string;
-  tracks: number;
-  created: number;
-  bitrate: number;
-}
-
+/** Forma real que devuelve la API de metadata (/api/videos). */
 export interface Video {
   id: string;
   title: string;
   owner: string;
+  topic: string;
+  tags: string[];
   visibility: Visibility;
-  uploaded: number;
-  isOwner: boolean;
+  file: string;
   dash: DashStatus;
-  meta: VideoMeta;
+  duration: number;
+  sizeBytes: number;
+  uploaded: number;
+  canEdit: boolean;
 }
 
 export type View = 'browse' | 'mine' | 'upload';

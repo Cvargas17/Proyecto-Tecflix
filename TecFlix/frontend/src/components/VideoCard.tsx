@@ -11,7 +11,7 @@ export default function VideoCard({ video, onOpen }: { video: Video; onOpen: (id
           <span className={`badge ${video.visibility}`}>{video.visibility}</span>
         </div>
         <div className="dim">
-          {video.owner} · {fmtDuration(video.meta.duration)} · {fmtSize(video.meta.size)}
+          {video.owner} · {fmtDuration(video.duration)} · {fmtSize(video.sizeBytes)}
         </div>
       </div>
     </div>
