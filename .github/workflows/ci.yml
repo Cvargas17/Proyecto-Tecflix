@@ -26,8 +26,6 @@ jobs:
           cd TecFlix/frontend
           npm ci
           npm run build
-          mkdir -p ../web/dist
-          cp -r dist/* ../web/dist/
 
       - name: Install C++ toolchain and coverage dependencies
         run: |
