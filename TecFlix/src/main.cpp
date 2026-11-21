@@ -1,4 +1,4 @@
-// TecFlix - a self-contained video sharing web server.
+// TecFlix - a self-contained video sharing web server (v2.0 stateless cluster-ready).
 // C++17, integrated with BTreeUserRepository, MetadataService/MetadataController,
 // FFmpeg DASH packager and OpenTelemetry.
 
@@ -69,6 +69,7 @@ static const size_t MAX_FORM = 64 * 1024;
 static fs::path DATA_DIR = "data";
 static fs::path WEB_DIR = "web/dist";
 static string gFfmpeg;
+static string gNodeName = "tecflix-node";
 
 // ---------------------------------------------------------------- utilities
 
@@ -274,7 +275,6 @@ struct Video {
 
 static std::mutex gMutex;
 static vector<Video> gVideos;
-static std::map<string, string> gSessions;  // token -> username
 static std::unordered_map<std::string, size_t> gVideoIndex;
 static std::mutex gQueueMutex;
 static std::condition_variable gQueueCondition;
@@ -303,10 +303,17 @@ static vector<string> splitTabs(const string& line) {
     }
     return f;
 }
-static void saveVideos();
 
-/// Quita un video del indice local y de videos.db (idempotente). Con MongoDB el repositorio remoto
-/// borra su documento, pero el indice local seguia guardandolo y al reiniciar se re-sincronizaba a Mongo.
+static void saveVideos() {  // caller holds gMutex
+    std::ofstream o(DATA_DIR / "videos.db", std::ios::trunc);
+    for (auto& v : gVideos)
+        o << v.id << '\t' << v.owner << '\t' << clean(v.title) << '\t' << v.visibility << '\t' << v.file << '\t'
+          << clean(v.orig) << '\t' << v.mime << '\t' << v.size << '\t' << v.uploaded << '\t' << v.created << '\t'
+          << v.duration << '\t' << v.width << '\t' << v.height << '\t' << v.tracks << '\t' << v.vcodec << '\t'
+          << v.acodec << '\t' << v.brand << '\t' << v.dash << '\n';
+}
+
+/// Quita un video del índice local y de videos.db (idempotente) para evitar re-sincronización a MongoDB.
 static void eraseVideoLocal(const string& id) {
     std::lock_guard<std::mutex> g(gMutex);
     auto it = gVideoIndex.find(id);
@@ -317,15 +324,9 @@ static void eraseVideoLocal(const string& id) {
     saveVideos();
 }
 
-static void saveVideos() {  // caller holds gMutex
-    std::ofstream o(DATA_DIR / "videos.db", std::ios::trunc);
-    for (auto& v : gVideos)
-        o << v.id << '\t' << v.owner << '\t' << clean(v.title) << '\t' << v.visibility << '\t' << v.file << '\t'
-          << clean(v.orig) << '\t' << v.mime << '\t' << v.size << '\t' << v.uploaded << '\t' << v.created << '\t'
-          << v.duration << '\t' << v.width << '\t' << v.height << '\t' << v.tracks << '\t' << v.vcodec << '\t'
-          << v.acodec << '\t' << v.brand << '\t' << v.dash << '\n';
-}
-static void loadVideosDb() {
+static void loadVideosDbLocked(bool markInterruptedFailed = false) {  // caller holds gMutex
+    gVideos.clear();
+    gVideoIndex.clear();
     std::string line;
     std::ifstream v(DATA_DIR / "videos.db");
     while (std::getline(v, line)) {
@@ -337,7 +338,7 @@ static void loadVideosDb() {
         x.duration = std::stod(f[10]); x.width = std::stoi(f[11]); x.height = std::stoi(f[12]);
         x.tracks = std::stoi(f[13]); x.vcodec = f[14]; x.acodec = f[15]; x.brand = f[16];
         if (f.size() > 17) x.dash = f[17];
-        if (x.dash == "processing") x.dash = "failed";
+        if (markInterruptedFailed && x.dash == "processing") x.dash = "failed";
 
         gVideos.push_back(x);
         gVideoIndex[x.id] = gVideos.size() - 1;
@@ -640,6 +641,7 @@ static string headerBlock(int code, const string& ctype, uint64_t len, const str
     std::ostringstream o;
     o << "HTTP/1.1 " << code << ' ' << statusText(code) << "\r\nContent-Type: " << ctype
       << "\r\nContent-Length: " << len << "\r\nConnection: close\r\nX-Content-Type-Options: nosniff\r\n"
+      << "X-Served-By: " << gNodeName << "\r\n"
       << extra << "\r\n";
     return o.str();
 }
@@ -694,7 +696,33 @@ static bool readBody(sock_t s, Req& r) {
     return true;
 }
 
-// ---------------------------------------------------------------- sessions
+// ---------------------------------------------------------------- sessions (Stateless V2.0)
+
+static string signSessionToken(const string& username) {
+    const string secret = getEnvOrDefault("SESSION_SECRET", "tecflix-v2-cluster-secret");
+    int64_t exp = static_cast<int64_t>(time(nullptr)) + 604800;  // 7 días
+    string payload = username + "." + std::to_string(exp);
+    string sig = toHex(sha256(secret + ":" + payload));
+    return payload + "." + sig;
+}
+
+static string verifySessionToken(const string& tok) {
+    size_t p1 = tok.find('.');
+    size_t p2 = (p1 == string::npos) ? string::npos : tok.find('.', p1 + 1);
+    if (p1 == string::npos || p2 == string::npos) return "";
+    string user = tok.substr(0, p1);
+    string expStr = tok.substr(p1 + 1, p2 - p1 - 1);
+    string sig = tok.substr(p2 + 1);
+    if (user.empty() || expStr.empty() || sig.size() != 64) return "";
+    try {
+        if (std::stoll(expStr) < static_cast<int64_t>(time(nullptr))) return "";
+    } catch (...) {
+        return "";
+    }
+    const string secret = getEnvOrDefault("SESSION_SECRET", "tecflix-v2-cluster-secret");
+    string expected = toHex(sha256(secret + ":" + user + "." + expStr));
+    return (sig == expected) ? user : "";
+}
 
 static string sessionUser(const Req& r) {
     if (auto hdr = r.h.find("x-user"); hdr != r.h.end() && !hdr->second.empty()) {
@@ -705,21 +733,8 @@ static string sessionUser(const Req& r) {
     size_t p = it->second.find("tf_session=");
     if (p == string::npos) return "";
     p += 11;
-    string tok = it->second.substr(p, it->second.find(';', p) - p);
-    std::lock_guard<std::mutex> g(gMutex);
-    auto s = gSessions.find(tok);
-    return s == gSessions.end() ? "" : s->second;
-}
-
-static void revokeUserSessions(const string& username) {
-    std::lock_guard<std::mutex> g(gMutex);
-    for (auto it = gSessions.begin(); it != gSessions.end();) {
-        if (lower(it->second) == lower(username)) {
-            it = gSessions.erase(it);
-        } else {
-            ++it;
-        }
-    }
+    string tok = trim(it->second.substr(p, it->second.find(';', p) - p));
+    return verifySessionToken(tok);
 }
 
 // ------------------------------------------------------------------- routes
@@ -797,17 +812,13 @@ static void handleAuth(sock_t s, Req& r, bool reg) {
         name = profile.username;
     }
 
-    string tok = randHex(24);
-    {
-        std::lock_guard<std::mutex> g(gMutex);
-        gSessions[tok] = name;
-    }
+    string tok = signSessionToken(name);
     json(s, reg ? 201 : 200, userProfileJson(profile),
          "Set-Cookie: tf_session=" + tok + "; Path=/; HttpOnly; SameSite=Lax; Max-Age=604800\r\n");
 }
 
 static void handleUsersEndpoint(sock_t s, Req& r, const string& me) {
-    const string targetUser = urldecode(r.path.substr(11));  // after "/api/users/"
+    const string targetUser = urldecode(r.path.substr(11));
     if (targetUser.empty() || targetUser.find('/') != string::npos) {
         return fail(s, 400, "Invalid username path");
     }
@@ -842,7 +853,6 @@ static void handleUsersEndpoint(sock_t s, Req& r, const string& me) {
         }
         string newSalt = randHex(16);
         string newHash = hashPassword(newSalt, newPw);
-        // quota_bytes es estrictamente inmutable: se ignora cualquier intento de cambiarlo
         if (!gUserRepository->updateCredentials(targetUser, newSalt, newHash)) {
             return fail(s, 404, "User not found");
         }
@@ -855,7 +865,6 @@ static void handleUsersEndpoint(sock_t s, Req& r, const string& me) {
         if (!gUserRepository->deleteUser(targetUser)) {
             return fail(s, 404, "User not found");
         }
-        revokeUserSessions(targetUser);
         return json(s, 200, "{\"deleted\":true,\"username\":" + jstr(targetUser) + "}",
                     "Set-Cookie: tf_session=; Path=/; Max-Age=0\r\n");
     }
@@ -871,7 +880,7 @@ static int gDashActive = 0;
 static const int MAX_DASH_JOBS = 2;
 
 static void packageDash(Video v) {
-    tecflix::observability::ScopedSpan span("ffmpeg.packageDash", "", {{"video.id", v.id}});
+    tecflix::observability::ScopedSpan span("ffmpeg.packageDash", "", {{"video.id", v.id}, {"node", gNodeName}});
     {
         std::unique_lock<std::mutex> lock(gDashMutex);
         gDashCondition.wait(lock, [] {
@@ -930,7 +939,6 @@ static void handleUpload(sock_t s, Req& r, const string& me) {
     string mime = mimeFor(ext);
     if (mime.empty()) return fail(s, 400, "Unsupported type. Use mp4, m4v, mov, webm, ogv or mkv");
 
-    // Invariante de cuota: validar y reservar antes de escribir un solo byte en disco
     if (!gUserRepository) return fail(s, 500, "User repository unavailable");
     auto userOpt = gUserRepository->findByUsername(me);
     if (!userOpt) return fail(s, 401, "User session invalid");
@@ -1093,6 +1101,10 @@ static void route(sock_t s, Req& r) {
             deletedId = p.substr(12);
             std::lock_guard<std::mutex> g(gMutex);
             auto idxIt = gVideoIndex.find(deletedId);
+            if (idxIt == gVideoIndex.end()) {
+                loadVideosDbLocked(false);
+                idxIt = gVideoIndex.find(deletedId);
+            }
             if (idxIt != gVideoIndex.end()) {
                 deletedFile = gVideos[idxIt->second].file;
                 deletedOwner = gVideos[idxIt->second].owner;
@@ -1115,25 +1127,21 @@ static void route(sock_t s, Req& r) {
         return json(s, res.statusCode, res.jsonBody);
     }
 
-    string traceId = r.h.count("x-trace-id") ? r.h["x-trace-id"] : "";
-    tecflix::observability::ScopedSpan span(m + " " + p, traceId, {{"http.method", m}, {"http.route", p}});
+    auto w3cCtx = tecflix::observability::TelemetryManager::parseTraceparent(
+        r.h.count("traceparent") ? r.h["traceparent"] : "");
+    string traceId = w3cCtx.valid ? w3cCtx.traceId : (r.h.count("x-trace-id") ? r.h["x-trace-id"] : "");
+    tecflix::observability::ScopedSpan span(m + " " + p,
+                                           traceId,
+                                           {{"http.method", m}, {"http.route", p}, {"node", gNodeName}},
+                                           w3cCtx.parentSpanId);
 
     if (p == "/health" && m == "GET") {
         span.setStatusCode(200);
-        return json(s, 200, "{\"status\":\"healthy\",\"service\":\"tecflix-server\"}");
+        return json(s, 200, "{\"status\":\"healthy\",\"service\":\"tecflix-server\",\"node\":" + jstr(gNodeName) + "}");
     }
     if (p == "/api/register" && m == "POST") return handleAuth(s, r, true);
     if (p == "/api/login" && m == "POST") return handleAuth(s, r, false);
     if (p == "/api/logout" && m == "POST") {
-        auto it = r.h.find("cookie");
-        if (it != r.h.end()) {
-            size_t q = it->second.find("tf_session=");
-            if (q != string::npos) {
-                q += 11;
-                std::lock_guard<std::mutex> g(gMutex);
-                gSessions.erase(it->second.substr(q, it->second.find(';', q) - q));
-            }
-        }
         return json(s, 200, "{}", "Set-Cookie: tf_session=; Path=/; Max-Age=0\r\n");
     }
     if (p == "/api/me" && m == "GET") {
@@ -1148,7 +1156,7 @@ static void route(sock_t s, Req& r) {
     }
     if (p == "/api/upload" && m == "POST") return handleUpload(s, r, me);
 
-    // /dash/<id>/<file>: manifest and segments of a packaged video
+    // /dash/<id>/<file>: manifest and segments (con sincronización multi-nodo)
     if (p.rfind("/dash/", 0) == 0 && (m == "GET" || m == "HEAD")) {
         string rest = p.substr(6);
         size_t sl = rest.find('/');
@@ -1160,6 +1168,10 @@ static void route(sock_t s, Req& r) {
         {
             std::lock_guard<std::mutex> g(gMutex);
             auto indexIt = gVideoIndex.find(did);
+            if (indexIt == gVideoIndex.end() || gVideos[indexIt->second].dash != "ready") {
+                loadVideosDbLocked(false);
+                indexIt = gVideoIndex.find(did);
+            }
             if (indexIt == gVideoIndex.end()) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
             Video& video = gVideos[indexIt->second];
             if (!canSee(video, me) || video.dash != "ready") { span.setStatusCode(404); return fail(s, 404, "Not found"); }
@@ -1168,7 +1180,7 @@ static void route(sock_t s, Req& r) {
         return streamFile(s, r, DATA_DIR / "dash" / did / name, ext == ".mpd" ? "application/dash+xml" : "video/mp4");
     }
 
-    // /video/<id>: streaming directo por rangos HTTP
+    // /video/<id>: streaming directo por rangos HTTP (con sincronización multi-nodo)
     if (p.rfind("/video/", 0) == 0) {
         string id = p.substr(7);
         if (!isHexId(id)) { span.setStatusCode(404); return fail(s, 404, "Not found"); }
@@ -1176,6 +1188,10 @@ static void route(sock_t s, Req& r) {
         {
             std::lock_guard<std::mutex> g(gMutex);
             auto indexIt = gVideoIndex.find(id);
+            if (indexIt == gVideoIndex.end()) {
+                loadVideosDbLocked(false);
+                indexIt = gVideoIndex.find(id);
+            }
             if (indexIt == gVideoIndex.end()) { span.setStatusCode(404); return fail(s, 404, "Video not found"); }
             Video& video = gVideos[indexIt->second];
             if (!canSee(video, me)) { span.setStatusCode(404); return fail(s, 404, "Video not found"); }
@@ -1247,21 +1263,23 @@ int main(int argc, char** argv) {
     int port = argc > 1 ? std::atoi(argv[1]) : std::stoi(getEnvOrDefault("PORT", "8080"));
     const string otlpHost = getEnvOrDefault("OTLP_HOST", "127.0.0.1");
     const int otlpPort = std::stoi(getEnvOrDefault("OTLP_PORT", "4318"));
+    gNodeName = getEnvOrDefault("NODE_NAME", getEnvOrDefault("HOSTNAME", "tecflix-node"));
 
     std::signal(SIGINT, onShutdownSignal);
     std::signal(SIGTERM, onShutdownSignal);
 
-    tecflix::observability::TelemetryManager::instance().init("tecflix-server", otlpHost, otlpPort);
+    tecflix::observability::TelemetryManager::instance().init(gNodeName, otlpHost, otlpPort);
 
     fs::create_directories(DATA_DIR / "videos");
-    loadVideosDb();
+    {
+        std::lock_guard<std::mutex> g(gMutex);
+        loadVideosDbLocked(true);
+    }
 
-    // Inicializar repositorio de Usuarios con Árbol B en disco
     gUserRepository = std::make_shared<tecflix::users::BTreeUserRepository>(
         (DATA_DIR / "users.idx").string(),
         (DATA_DIR / "users.db").string());
 
-    // Inicializar capa de Metadata API (MongoDB en despliegue o repositorio embebido en local)
 #ifdef TECFLIX_USE_MONGODB
     mongocxx::instance mongoInstance{};
     const string mongoUri = getEnvOrDefault("MONGO_URI", "mongodb://localhost:27017");
@@ -1314,7 +1332,7 @@ int main(int argc, char** argv) {
         tecflix::observability::TelemetryManager::instance().shutdown();
         return 1;
     }
-    std::cout << "TecFlix running at http://localhost:" << port << "  (Ctrl+C to stop)\n";
+    std::cout << "TecFlix [" << gNodeName << "] running at http://localhost:" << port << "  (Ctrl+C to stop)\n";
 
     const unsigned int numWorkers = std::max(2u, std::thread::hardware_concurrency());
     std::vector<std::thread> workers;
