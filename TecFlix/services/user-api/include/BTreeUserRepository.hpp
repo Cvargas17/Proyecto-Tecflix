@@ -21,6 +21,7 @@ public:
                            const std::string& newSalt,
                            const std::string& newPasswordHash) override;
     bool deleteUser(const std::string& username) override;
+    std::vector<UserRecord> listUsers() const override;
 
     bool reserveQuota(const std::string& username, uint64_t bytesToAdd) override;
     bool releaseQuota(const std::string& username, uint64_t bytesToRelease) override;

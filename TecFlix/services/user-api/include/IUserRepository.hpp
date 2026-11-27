@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <vector>
 
 namespace tecflix::users {
 
@@ -17,6 +18,7 @@ public:
                                    const std::string& newSalt,
                                    const std::string& newPasswordHash) = 0;
     virtual bool deleteUser(const std::string& username) = 0;
+    virtual std::vector<UserRecord> listUsers() const = 0;
 
     // Gestión atómica de cuota inmutable
     virtual bool reserveQuota(const std::string& username, uint64_t bytesToAdd) = 0;

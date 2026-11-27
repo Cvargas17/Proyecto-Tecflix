@@ -94,6 +94,8 @@
       - OTLP_PORT=4318
       - NODE_NAME=tecflix-node-1
       - SESSION_SECRET=tecflix-v2-cluster-secret
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin123
     volumes:
       - tecflix_shared_data:/app/data
     depends_on:
@@ -117,6 +119,8 @@
       - OTLP_PORT=4318
       - NODE_NAME=tecflix-node-2
       - SESSION_SECRET=tecflix-v2-cluster-secret
+      - ADMIN_USERNAME=admin
+      - ADMIN_PASSWORD=admin123
     volumes:
       - tecflix_shared_data:/app/data
     depends_on:

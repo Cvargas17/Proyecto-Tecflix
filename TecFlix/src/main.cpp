@@ -284,6 +284,7 @@ static sock_t gListenSocket = INVALID_SOCKET;
 
 // Instancias globales de los repositorios y servicios
 static std::shared_ptr<tecflix::users::IUserRepository> gUserRepository;
+static std::shared_ptr<tecflix::metadata::IMetadataRepository> gMetaRepo;
 static std::shared_ptr<tecflix::metadata::MetadataService> gMetadataService;
 static std::shared_ptr<tecflix::metadata::MetadataController> gMetadataController;
 
@@ -739,13 +740,17 @@ static string sessionUser(const Req& r) {
 
 // ------------------------------------------------------------------- routes
 
+static string adminUsername() { return getEnvOrDefault("ADMIN_USERNAME", "admin"); }
+static bool isAdminName(const string& name) { return !name.empty() && lower(name) == lower(adminUsername()); }
+
 static string userProfileJson(const tecflix::users::UserRecord& u) {
     uint64_t remaining = (u.used_bytes >= u.quota_bytes) ? 0 : (u.quota_bytes - u.used_bytes);
     std::ostringstream o;
     o << "{\"username\":" << jstr(u.username)
       << ",\"quota_bytes\":" << u.quota_bytes
       << ",\"used_bytes\":" << u.used_bytes
-      << ",\"remaining_bytes\":" << remaining << "}";
+      << ",\"remaining_bytes\":" << remaining
+      << ",\"isAdmin\":" << (isAdminName(u.username) ? "true" : "false") << "}";
     return o.str();
 }
 
@@ -783,6 +788,7 @@ static void handleAuth(sock_t s, Req& r, bool reg) {
         bool ok = name.size() >= 3 && name.size() <= 20 &&
                   std::all_of(name.begin(), name.end(), [](unsigned char c) { return isalnum(c) || c == '_'; });
         if (!ok) return fail(s, 400, "Username must be 3-20 letters, digits or underscore");
+        if (isAdminName(name)) return fail(s, 409, "Username already taken");
         if (pw.size() < 6) return fail(s, 400, "Password must have at least 6 characters");
 
         const uint64_t defaultQuota = static_cast<uint64_t>(
@@ -862,6 +868,7 @@ static void handleUsersEndpoint(sock_t s, Req& r, const string& me) {
     }
 
     if (r.method == "DELETE") {
+        if (isAdminName(targetUser)) return fail(s, 403, "The administrator account cannot be deleted");
         if (!gUserRepository->deleteUser(targetUser)) {
             return fail(s, 404, "User not found");
         }
@@ -870,6 +877,130 @@ static void handleUsersEndpoint(sock_t s, Req& r, const string& me) {
     }
 
     return fail(s, 405, "Method not allowed");
+}
+
+// ---- Panel de administración ----
+
+/// Borra un video por completo (archivo, DASH, metadatos, índice local y cuota del dueño).
+static bool adminDeleteVideo(const string& id) {
+    string file, owner;
+    uint64_t size = 0;
+    {
+        std::lock_guard<std::mutex> g(gMutex);
+        loadVideosDbLocked(false);
+        auto it = gVideoIndex.find(id);
+        if (it == gVideoIndex.end()) return false;
+        file = gVideos[it->second].file;
+        owner = gVideos[it->second].owner;
+        size = gVideos[it->second].size;
+    }
+    if (gMetaRepo) gMetaRepo->remove(id);
+    std::error_code ec;
+    if (!file.empty()) fs::remove(DATA_DIR / "videos" / file, ec);
+    fs::remove_all(DATA_DIR / "dash" / id, ec);
+    eraseVideoLocal(id);
+    if (gUserRepository && !owner.empty() && size > 0) gUserRepository->releaseQuota(owner, size);
+    return true;
+}
+
+static void handleAdmin(sock_t s, Req& r, const string& me) {
+    if (me.empty()) return fail(s, 401, "Authentication required");
+    if (!isAdminName(me)) return fail(s, 403, "Administrator access required");
+    if (!gUserRepository) return fail(s, 500, "User repository unavailable");
+    const string& p = r.path;
+    const string& m = r.method;
+
+    if (p == "/api/admin/users" && m == "GET") {
+        auto users = gUserRepository->listUsers();
+        std::ostringstream o;
+        o << "{\"items\":[";
+        bool first = true;
+        for (auto& u : users) {
+            if (!first) o << ",";
+            first = false;
+            o << "{\"username\":" << jstr(u.username) << ",\"quota_bytes\":" << u.quota_bytes
+              << ",\"used_bytes\":" << u.used_bytes << ",\"created_at\":" << u.created_at
+              << ",\"isAdmin\":" << (isAdminName(u.username) ? "true" : "false") << "}";
+        }
+        o << "]}";
+        return json(s, 200, o.str());
+    }
+
+    if (p == "/api/admin/users" && m == "POST") {
+        if (!readBody(s, r)) return fail(s, 400, "Bad request body");
+        string name, pw;
+        if (!r.body.empty() && r.body.front() == '{') {
+            name = extractJsonStringField(r.body, "username");
+            pw = extractJsonStringField(r.body, "password");
+        } else {
+            auto f = parseForm(r.body);
+            name = f["username"];
+            pw = f["password"];
+        }
+        name = trim(name);
+        bool ok = name.size() >= 3 && name.size() <= 20 &&
+                  std::all_of(name.begin(), name.end(), [](unsigned char c) { return isalnum(c) || c == '_'; });
+        if (!ok) return fail(s, 400, "Username must be 3-20 letters, digits or underscore");
+        if (pw.size() < 6) return fail(s, 400, "Password must have at least 6 characters");
+        tecflix::users::UserRecord rec;
+        std::strncpy(rec.username, name.c_str(), sizeof(rec.username) - 1);
+        string salt = randHex(16);
+        string hash = hashPassword(salt, pw);
+        std::strncpy(rec.salt, salt.c_str(), sizeof(rec.salt) - 1);
+        std::strncpy(rec.password_hash, hash.c_str(), sizeof(rec.password_hash) - 1);
+        rec.quota_bytes = static_cast<uint64_t>(std::stoull(getEnvOrDefault(
+            "DEFAULT_QUOTA_BYTES", std::to_string(tecflix::users::DEFAULT_MAX_QUOTA_BYTES))));
+        rec.created_at = static_cast<int64_t>(time(nullptr));
+        if (isAdminName(name) || !gUserRepository->createUser(rec)) return fail(s, 409, "Username already taken");
+        return json(s, 201, userProfileJson(rec));
+    }
+
+    if (p.rfind("/api/admin/users/", 0) == 0 && m == "DELETE") {
+        const string target = urldecode(p.substr(17));
+        if (target.empty() || target.find('/') != string::npos) return fail(s, 400, "Invalid username path");
+        if (isAdminName(target)) return fail(s, 403, "The administrator account cannot be deleted");
+        auto found = gUserRepository->findByUsername(target);
+        if (!found) return fail(s, 404, "User not found");
+        vector<string> ids;
+        {
+            std::lock_guard<std::mutex> g(gMutex);
+            loadVideosDbLocked(false);
+            for (auto& v : gVideos) if (v.owner == target) ids.push_back(v.id);
+        }
+        for (auto& id : ids) adminDeleteVideo(id);
+        if (!gUserRepository->deleteUser(target)) return fail(s, 404, "User not found");
+        return json(s, 200, "{\"deleted\":true,\"username\":" + jstr(target) + ",\"videosDeleted\":" +
+                                std::to_string(ids.size()) + "}");
+    }
+
+    if (p == "/api/admin/videos" && m == "GET") {
+        std::ostringstream o;
+        o << "{\"items\":[";
+        {
+            std::lock_guard<std::mutex> g(gMutex);
+            loadVideosDbLocked(false);
+            bool first = true;
+            for (auto& v : gVideos) {
+                if (!first) o << ",";
+                first = false;
+                o << "{\"id\":" << jstr(v.id) << ",\"title\":" << jstr(v.title) << ",\"owner\":" << jstr(v.owner)
+                  << ",\"visibility\":" << jstr(v.visibility) << ",\"dash\":" << jstr(v.dash)
+                  << ",\"sizeBytes\":" << v.size << ",\"duration\":" << v.duration
+                  << ",\"uploaded\":" << v.uploaded << "}";
+            }
+        }
+        o << "]}";
+        return json(s, 200, o.str());
+    }
+
+    if (p.rfind("/api/admin/videos/", 0) == 0 && m == "DELETE") {
+        const string id = p.substr(18);
+        if (!isHexId(id)) return fail(s, 400, "Invalid video id");
+        if (!adminDeleteVideo(id)) return fail(s, 404, "Video not found");
+        return json(s, 200, "{\"deleted\":true,\"id\":" + jstr(id) + "}");
+    }
+
+    fail(s, 404, "Not found");
 }
 
 // ---- DASH packaging (ffmpeg): data/dash/<id>/manifest.mpd + fMP4 segments ----
@@ -1151,6 +1282,7 @@ static void route(sock_t s, Req& r) {
         if (!found) return fail(s, 404, "User not found");
         return json(s, 200, userProfileJson(*found));
     }
+    if (p.rfind("/api/admin/", 0) == 0) return handleAdmin(s, r, me);
     if (p.rfind("/api/users/", 0) == 0) {
         return handleUsersEndpoint(s, r, me);
     }
@@ -1280,6 +1412,19 @@ int main(int argc, char** argv) {
         (DATA_DIR / "users.idx").string(),
         (DATA_DIR / "users.db").string());
 
+    // Cuenta de administrador (ADMIN_USERNAME / ADMIN_PASSWORD), creada si no existe.
+    if (!gUserRepository->findByUsername(adminUsername())) {
+        tecflix::users::UserRecord adm;
+        std::strncpy(adm.username, adminUsername().c_str(), sizeof(adm.username) - 1);
+        string salt = randHex(16);
+        string hash = hashPassword(salt, getEnvOrDefault("ADMIN_PASSWORD", "admin123"));
+        std::strncpy(adm.salt, salt.c_str(), sizeof(adm.salt) - 1);
+        std::strncpy(adm.password_hash, hash.c_str(), sizeof(adm.password_hash) - 1);
+        adm.quota_bytes = 107374182400ULL;  // 100 GiB
+        adm.created_at = static_cast<int64_t>(time(nullptr));
+        gUserRepository->createUser(adm);
+    }
+
 #ifdef TECFLIX_USE_MONGODB
     mongocxx::instance mongoInstance{};
     const string mongoUri = getEnvOrDefault("MONGO_URI", "mongodb://localhost:27017");
@@ -1294,6 +1439,7 @@ int main(int argc, char** argv) {
 #else
     auto metaRepo = std::make_shared<EmbeddedMetadataRepository>();
 #endif
+    gMetaRepo = metaRepo;
     gMetadataService = std::make_shared<tecflix::metadata::MetadataService>(metaRepo);
     gMetadataController = std::make_shared<tecflix::metadata::MetadataController>(gMetadataService);
 

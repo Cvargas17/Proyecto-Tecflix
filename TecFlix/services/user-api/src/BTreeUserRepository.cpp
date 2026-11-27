@@ -23,6 +23,10 @@ bool BTreeUserRepository::deleteUser(const std::string& username) {
     return tree_->deleteUser(username);
 }
 
+std::vector<UserRecord> BTreeUserRepository::listUsers() const {
+    return tree_->listUsers();
+}
+
 bool BTreeUserRepository::reserveQuota(const std::string& username, uint64_t bytesToAdd) {
     return tree_->reserveQuota(username, bytesToAdd);
 }

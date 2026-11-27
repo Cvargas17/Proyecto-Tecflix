@@ -5,6 +5,26 @@ export interface UserProfile {
   quota_bytes?: number;
   used_bytes?: number;
   remaining_bytes?: number;
+  isAdmin?: boolean;
+}
+
+export interface AdminUser {
+  username: string;
+  quota_bytes: number;
+  used_bytes: number;
+  created_at: number;
+  isAdmin: boolean;
+}
+
+export interface AdminVideo {
+  id: string;
+  title: string;
+  owner: string;
+  visibility: Visibility;
+  dash: string;
+  sizeBytes: number;
+  duration: number;
+  uploaded: number;
 }
 
 export interface AuthenticatedUserProfile extends UserProfile {
@@ -52,6 +72,17 @@ export const api = {
   register: (username: string, password: string) =>
     request<AuthenticatedUserProfile>('/api/register', postForm({ username, password })),
   logout: () => request<object>('/api/logout', { method: 'POST' }),
+
+  admin: {
+    users: () => request<{ items: AdminUser[] }>('/api/admin/users').then((r) => r.items),
+    createUser: (username: string, password: string) =>
+      request<UserProfile>('/api/admin/users', postForm({ username, password })),
+    deleteUser: (username: string) =>
+      request<{ videosDeleted: number }>('/api/admin/users/' + encodeURIComponent(username), { method: 'DELETE' }),
+    videos: () => request<{ items: AdminVideo[] }>('/api/admin/videos').then((r) => r.items),
+    deleteVideo: (id: string) =>
+      request<object>('/api/admin/videos/' + encodeURIComponent(id), { method: 'DELETE' }),
+  },
 
   list: async (params: ListVideosParams = {}): Promise<PaginatedVideos> => {
     const query = new URLSearchParams();

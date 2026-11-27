@@ -143,3 +143,13 @@ Cada *push* o *Pull Request* ejecuta `.github/workflows/ci.yml` en GitHub Action
 2. **Unit Tests & Coverage:** Ejecuta `MetadataApiUnitTests`, `UserApiUnitTests`, `TelemetryUnitTests` y `ServerCryptoSelfTest` exigiendo **$\ge 90\%$** de cobertura con `gcovr`[cite: 40].
 3. **Release Artifacts:** Genera y publica los ejecutables empaquetados para **Linux (`x64`)** y **Windows (`MinGW x64`)**[cite: 40].
 4. **Functional E2E Tests:** Levanta el servidor compilado y ejecuta pruebas de interfaz de usuario y API con **Playwright** en Chromium[cite: 40].
+---
+
+## Panel de Administración (V2.0)
+
+El usuario administrador (`ADMIN_USERNAME`, por defecto `admin`; contraseña `ADMIN_PASSWORD`, por defecto `admin123`) se crea automáticamente al arrancar. Al iniciar sesión aparece la pestaña **Admin**, que permite:
+
+* Ver usuarios registrados (recorrido in-order del Árbol B), crear y eliminar usuarios (al eliminar un usuario se borran sus videos).
+* Ver todos los videos (incluidos privados), subir nuevos y eliminarlos.
+
+Endpoints (solo administrador): `GET/POST /api/admin/users`, `DELETE /api/admin/users/{username}`, `GET /api/admin/videos`, `DELETE /api/admin/videos/{id}`. **Cambia `ADMIN_PASSWORD` en producción.**

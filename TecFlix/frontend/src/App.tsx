@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type UserProfile } from './api';
+import AdminDashboard from './components/AdminDashboard';
 import AuthModal from './components/AuthModal';
 import PlayerModal from './components/PlayerModal';
 import UploadView from './components/UploadView';
@@ -54,6 +55,7 @@ export default function App() {
           {tab('browse', 'Browse')}
           {tab('mine', 'My Videos')}
           {tab('upload', 'Upload')}
+          {user?.isAdmin && tab('admin', 'Admin')}
         </nav>
         <div style={{ display: 'flex', alignItems: 'center', gap: '0.75rem' }}>
           {user?.username ? (
@@ -85,6 +87,7 @@ export default function App() {
             <VideoGrid scope="mine" reloadKey={reloadKey} onOpen={setPlaying} />
           </>
         )}
+        {view === 'admin' && user?.isAdmin && <AdminDashboard user={user} />}
         {view === 'upload' && (
           <UploadView
             user={user}

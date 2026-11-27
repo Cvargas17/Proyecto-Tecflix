@@ -517,6 +517,35 @@ bool DiskBTree::insertUser(const UserRecord& user) {
     return true;
 }
 
+void DiskBTree::collectInOrder(int64_t nodeOffset, std::vector<int64_t>& out) const {
+    if (nodeOffset < 0) return;
+    BTreeNode node = readNode(nodeOffset);
+    for (int i = 0; i < node.num_keys; ++i) {
+        if (node.is_leaf == 0) collectInOrder(node.children[i], out);
+        out.push_back(node.data_offsets[i]);
+    }
+    if (node.is_leaf == 0) collectInOrder(node.children[node.num_keys], out);
+}
+
+std::vector<UserRecord> DiskBTree::listUsers() const {
+    std::shared_lock<std::shared_mutex> lock(rwMutex_);
+    CrossProcessFileLock procLock(indexFile_);
+    refreshHeader();
+
+    std::vector<int64_t> offsets;
+    collectInOrder(rootOffset_, offsets);
+    std::vector<UserRecord> users;
+    std::ifstream file(dataFile_, std::ios::binary);
+    for (int64_t off : offsets) {
+        UserRecord u;
+        file.seekg(off);
+        file.read(reinterpret_cast<char*>(&u), sizeof(UserRecord));
+        if (file) users.push_back(u);
+        file.clear();
+    }
+    return users;
+}
+
 std::optional<UserRecord> DiskBTree::getUser(const std::string& username) const {
     tecflix::observability::ScopedSpan span("btree.lookup", "", {{"btree.op", "get"}, {"user", username}});
     std::shared_lock<std::shared_mutex> lock(rwMutex_);

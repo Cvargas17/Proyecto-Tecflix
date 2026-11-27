@@ -17,4 +17,4 @@ export interface Video {
   canEdit: boolean;
 }
 
-export type View = 'browse' | 'mine' | 'upload';
+export type View = 'browse' | 'mine' | 'upload' | 'admin';

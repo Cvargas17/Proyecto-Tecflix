@@ -5,6 +5,7 @@
 #include <shared_mutex>
 #include <string>
 #include <utility>
+#include <vector>
 
 namespace tecflix::users {
 
@@ -27,6 +28,7 @@ private:
     int64_t appendUserRecord(const UserRecord& user);
 
     // Búsqueda e inserción O(log_t n)
+    void collectInOrder(int64_t nodeOffset, std::vector<int64_t>& out) const;
     std::optional<int64_t> searchInternal(int64_t nodeOffset, const char* key) const;
     void splitChild(int64_t parentOffset, int index, int64_t childOffset);
     void insertNonFull(int64_t nodeOffset, const char* key, int64_t dataOffset);
@@ -52,6 +54,9 @@ public:
                            const std::string& newSalt,
                            const std::string& newPasswordHash);
     bool deleteUser(const std::string& username);
+
+    /// Recorrido in-order del Árbol B: todos los usuarios ordenados por username.
+    std::vector<UserRecord> listUsers() const;
 
     bool reserveQuota(const std::string& username, uint64_t bytesToAdd);
     bool releaseQuota(const std::string& username, uint64_t bytesToRelease);
